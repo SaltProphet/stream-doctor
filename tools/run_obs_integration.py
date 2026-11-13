@@ -105,7 +105,7 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
         test_value = 1234 if original_bitrate != 1234 else 1200
         applied = await change_profile_bitrate(client, profile_name, original_bitrate, test_value)
         restored = await change_profile_bitrate(client, profile_name, test_value, original_bitrate)
-        print(f"OBS Simple Output bitrate verified: {original_bitrate} → {applied['bitrate']} → {restored['bitrate']}", flush=True)
+        print(f"OBS Simple Output bitrate verified: {original_bitrate} -> {applied['bitrate']} -> {restored['bitrate']}", flush=True)
         settings_cycle = {"status": "PASS", "controlled_test": True, "verified_apply": True,
                           "applied_bitrate": applied["bitrate"], "restored_bitrate": restored["bitrate"],
                           "original_bitrate": original_bitrate}

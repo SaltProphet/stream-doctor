@@ -63,6 +63,8 @@ jobs:
           if-no-files-found: error
 
   disposable-obs:
+    env:
+      PYTHONUTF8: "1"
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
