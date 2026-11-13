@@ -13,10 +13,17 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+import psutil
+
+# Direct execution puts ``tools`` ahead of the repository root on sys.path.
+# Prefer the checkout package over any separately installed stream_doctor.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtGui import QImage
 
@@ -43,6 +50,24 @@ async def request_retry(client: ObsClient, request_type: str, request_data: dict
             await asyncio.sleep(0.5)
             await client.connect()
     raise last_error
+
+
+async def wait_for_receiver(process: asyncio.subprocess.Process, port: int, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.returncode is not None:
+            raise RuntimeError(f"Local RTMP receiver exited before listening: {process.returncode}")
+        listening = any(
+            connection.status == psutil.CONN_LISTEN
+            and connection.laddr.port == port
+            and connection.pid == process.pid
+            for connection in psutil.net_connections(kind="tcp")
+            if connection.laddr
+        )
+        if listening:
+            return
+        await asyncio.sleep(0.1)
+    raise TimeoutError(f"Local RTMP receiver did not listen on port {port}.")
 
 
 async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
@@ -77,6 +102,7 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
     authentication_enforced = False
     local_output_server = None
     ffmpeg_log = None
+    ffmpeg_progress = None
     try:
         for _ in range(20):
             try:
@@ -123,16 +149,25 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
         active_output_samples = []
         if active_output:
             ffmpeg_log = (root / "ffmpeg.log").open("w+b")
+            ffmpeg_progress = root / "ffmpeg-progress.txt"
             local_output_server = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                 "-listen", "1", "-i", "rtmp://127.0.0.1:19350/live/stream-doctor-local",
+                "-progress", str(ffmpeg_progress),
                 "-c", "copy", "-f", "null", "-", stdout=subprocess.DEVNULL, stderr=ffmpeg_log,
             )
-            await asyncio.sleep(1)
+            await wait_for_receiver(local_output_server, 19350)
             service = await client.request("GetStreamServiceSettings")
             configured = service.get("streamServiceSettings", {})
             if service.get("streamServiceType") != "rtmp_custom" or configured.get("server") != "rtmp://127.0.0.1:19350/live":
                 raise RuntimeError("Disposable OBS did not load its loopback RTMP service.")
+            await client.request("SetStreamServiceSettings", {
+                "streamServiceType": "rtmp_custom",
+                "streamServiceSettings": {
+                    "server": "rtmp://127.0.0.1:19350/live",
+                    "key": "stream-doctor-local",
+                },
+            })
             await client.request("StartStream")
             for _ in range(80):
                 status = await client.request("GetStreamStatus")
@@ -190,7 +225,20 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             await monitor.run(max_samples=3)
         await client.connect()
         recovery = await request_retry(client, "GetVersion")
+        receiver_progress = {}
+        if ffmpeg_progress is not None and ffmpeg_progress.exists():
+            for line in ffmpeg_progress.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    receiver_progress[key] = value
+        receiver_media_observed = bool(
+            int(receiver_progress.get("frame", "0") or 0) > 0
+            or int(receiver_progress.get("out_time_ms", "0") or 0) > 0
+        )
+        if active_output and not receiver_media_observed:
+            raise RuntimeError("Local RTMP receiver did not report decoded media.")
         result = {"status": "PASS", "authenticated": authentication_enforced, "identified": identified, "identified_observation": "OBS WebSocket 5.x accepted the configured test password and rejected an incorrect password", "version": version, "encoder_capabilities": encoder_capabilities, "settings_cycle": settings_cycle, "active_output": active_output, "active_output_samples": active_output_samples, "active_monitor_records": sum(1 for record in monitor.records if record.get("sample", {}).get("stream_active")), "websocket_recovery": {"verified": bool(recovery.get("obsVersion")), "version": recovery.get("obsVersion")}, "monitoring_records": monitor.records, "incident_count": len(incident_store.search()), "scene_created": bool(scene is not None), "screenshot_dimensions": [image.width(), image.height()], "frame_observations": observations, "blackout_events": blackout_events, "blackout_incidents": blackout_store.search(), "hardware": hardware_snapshot()}
+        result["receiver"] = {"media_observed": receiver_media_observed, "progress": receiver_progress}
         report_path = root / "stream-doctor-obs-report.json"
         export_report(result, report_path, "json")
         print(json.dumps({**result, "report": str(report_path)}, indent=2, default=str))
