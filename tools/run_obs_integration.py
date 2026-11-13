@@ -61,6 +61,13 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
     profile = config / "basic" / "profiles" / "StreamDoctorTest"
     profile.mkdir(parents=True)
     (profile / "basic.ini").write_text("[General]\nName=StreamDoctorTest\n[Output]\nMode=Simple\n[SimpleOutput]\nRecFormat=mp4\nFilePath=C:\\Users\\Public\\Videos\\StreamDoctorTest\n", encoding="utf-8")
+    if active_output:
+        (profile / "service.json").write_text(json.dumps({
+            "type": "rtmp_custom",
+            "settings": {"server": "rtmp://127.0.0.1:19350/live", "key": "stream-doctor-local"},
+        }), encoding="utf-8")
+        with (profile / "basic.ini").open("a", encoding="utf-8") as config_file:
+            config_file.write("StreamEncoder=x264\nStreamAudioEncoder=aac\nVBitrate=6000\n")
     staged_exe = staged_obs / "bin" / "64bit" / obs_path.name
     process = subprocess.Popen([str(staged_exe), "--multi", "--profile", "StreamDoctorTest", "--collection", "StreamDoctorTest", "--minimize-to-tray"], cwd=staged_exe.parent, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(f"started test OBS pid={process.pid}", flush=True)
@@ -121,8 +128,11 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
                 "-c", "copy", "-f", "null", "-", stdout=subprocess.DEVNULL, stderr=ffmpeg_log,
             )
             await asyncio.sleep(1)
-            await request_retry(client, "SetStreamServiceSettings", {"streamServiceType": "rtmp_custom", "streamServiceSettings": {"server": "rtmp://127.0.0.1:19350/live", "key": "stream-doctor-local"}})
-            await request_retry(client, "StartStream")
+            service = await client.request("GetStreamServiceSettings")
+            configured = service.get("streamServiceSettings", {})
+            if service.get("streamServiceType") != "rtmp_custom" or configured.get("server") != "rtmp://127.0.0.1:19350/live":
+                raise RuntimeError("Disposable OBS did not load its loopback RTMP service.")
+            await client.request("StartStream")
             for _ in range(80):
                 status = await client.request("GetStreamStatus")
                 active_output_samples.append(bool(status.get("outputActive")))
