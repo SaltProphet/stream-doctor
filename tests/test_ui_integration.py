@@ -207,8 +207,9 @@ def test_dashboard_shows_sustained_congestion_evidence_and_measured_basis():
 def test_dashboard_reports_next_broadcast_correction_result():
     _app()
     window = MainWindow()
-    window._last_broadcast_metrics = {"sustained_congestion": True, "max_congestion": 1.0, "skipped_frames": 80}
+    window._last_broadcast_metrics = {"samples": 3, "sustained_congestion": True, "max_congestion": 1.0, "skipped_frames": 80}
     window._pending_correction = {"target": 3000, "baseline": window._last_broadcast_metrics}
+    window._on_sample({"sample": {"stream_active": True, "output_congestion": 0.0, "dropped_frames": 0, "reconnecting": False}, "diagnosis": {}, "video": None})
     window._on_sample({"sample": {"stream_active": True, "output_congestion": 0.0, "dropped_frames": 0, "reconnecting": False}, "diagnosis": {}, "video": None})
     window._on_sample({"sample": {"stream_active": False}, "diagnosis": {}, "video": None})
     assert "improved" in window.next_broadcast_result.text().lower()

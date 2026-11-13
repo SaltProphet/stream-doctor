@@ -16,7 +16,7 @@ class ObsConnectionError(RuntimeError):
 
 class ObsClient:
     """Small OBS WebSocket 5.x client using the documented hello/identify flow."""
-    OUTPUT_EVENT_SUBSCRIPTIONS = 64
+    OUTPUT_EVENT_SUBSCRIPTIONS = 16
 
     def __init__(self, url: str = "ws://127.0.0.1:4455", password: str | None = None, request_timeout: float = 10.0):
         self.url, self.password, self.socket = url, password, None

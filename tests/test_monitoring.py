@@ -57,14 +57,29 @@ def test_summarize_broadcast_marks_sustained_congestion_and_skipped_delta():
 
 
 def test_compare_broadcasts_reports_congestion_and_skipped_frame_improvement():
-    before = {"sustained_congestion": True, "max_congestion": 1.0, "skipped_frames": 80}
-    after = {"sustained_congestion": False, "max_congestion": 0.0, "skipped_frames": 0}
+    before = {"samples": 3, "sustained_congestion": True, "max_congestion": 1.0, "skipped_frames": 80}
+    after = {"samples": 3, "sustained_congestion": False, "max_congestion": 0.0, "skipped_frames": 0}
 
     assert compare_broadcasts(before, after) == {
         "congestion_improved": True,
         "skipped_frames_improved": True,
         "improved": True,
+        "sufficient_evidence": True,
     }
+
+
+def test_summarize_broadcast_requires_consecutive_congestion_samples():
+    result = summarize_broadcast([
+        {"stream_active": True, "output_congestion": 0.8},
+        {"stream_active": True, "output_congestion": 0.1},
+        {"stream_active": True, "output_congestion": 0.9},
+        {"stream_active": True, "output_congestion": 0.2},
+        {"stream_active": True, "output_congestion": 0.7},
+    ])
+
+    assert result["congestion_samples"] == 3
+    assert result["longest_congestion_run"] == 1
+    assert result["sustained_congestion"] is False
 
 
 def test_live_monitor_persists_samples_and_reconnects_after_disconnect(tmp_path):

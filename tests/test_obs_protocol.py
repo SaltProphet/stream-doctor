@@ -38,7 +38,7 @@ async def test_obs_websocket_5_handshake_and_request(monkeypatch):
     response = await client.request("GetStats")
     assert response["cpuUsage"] == 2.5
     assert socket.sent[0]["op"] == 1
-    assert socket.sent[0]["d"]["eventSubscriptions"] == 64
+    assert socket.sent[0]["d"]["eventSubscriptions"] == 16
     assert socket.sent[1]["d"]["requestType"] == "GetStats"
 
 

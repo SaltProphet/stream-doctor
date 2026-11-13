@@ -18,10 +18,19 @@ def summarize_broadcast(samples: list[dict[str, Any]]) -> dict[str, Any]:
     congestion = [float(sample.get("output_congestion")) for sample in active if isinstance(sample.get("output_congestion"), (int, float))]
     skipped = [int(sample.get("dropped_frames")) for sample in active if isinstance(sample.get("dropped_frames"), int)]
     congested = sum(value >= CONGESTION_THRESHOLD for value in congestion)
+    longest_run = 0
+    current_run = 0
+    for value in congestion:
+        if value >= CONGESTION_THRESHOLD:
+            current_run += 1
+            longest_run = max(longest_run, current_run)
+        else:
+            current_run = 0
     return {
         "samples": len(active),
         "congestion_samples": congested,
-        "sustained_congestion": congested >= SUSTAINED_CONGESTION_SAMPLES,
+        "sustained_congestion": longest_run >= SUSTAINED_CONGESTION_SAMPLES,
+        "longest_congestion_run": longest_run,
         "max_congestion": max(congestion, default=0.0),
         "skipped_frames": max(0, skipped[-1] - skipped[0]) if len(skipped) >= 2 else 0,
         "reconnects": sum(bool(sample.get("reconnecting")) for sample in active),
@@ -30,14 +39,16 @@ def summarize_broadcast(samples: list[dict[str, Any]]) -> dict[str, Any]:
 
 def compare_broadcasts(before: dict[str, Any], after: dict[str, Any]) -> dict[str, bool]:
     """Compare delivery evidence from broadcasts before and after a correction."""
+    sufficient_evidence = int(before.get("samples", 0)) >= 2 and int(after.get("samples", 0)) >= 2
     congestion_improved = (
         bool(before.get("sustained_congestion")) and not bool(after.get("sustained_congestion"))
     ) or float(after.get("max_congestion", 0.0)) < float(before.get("max_congestion", 0.0))
     skipped_frames_improved = int(after.get("skipped_frames", 0)) < int(before.get("skipped_frames", 0))
     return {
-        "congestion_improved": congestion_improved,
-        "skipped_frames_improved": skipped_frames_improved,
-        "improved": congestion_improved and skipped_frames_improved,
+        "congestion_improved": sufficient_evidence and congestion_improved,
+        "skipped_frames_improved": sufficient_evidence and skipped_frames_improved,
+        "improved": sufficient_evidence and congestion_improved and skipped_frames_improved,
+        "sufficient_evidence": sufficient_evidence,
     }
 
 

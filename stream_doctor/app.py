@@ -1187,12 +1187,17 @@ class MainWindow(QMainWindow):
             self._last_broadcast_metrics = metrics
             if self._pending_correction and self._pending_correction.get("baseline"):
                 comparison = compare_broadcasts(self._pending_correction["baseline"], metrics)
-                outcome = "improved" if comparison["improved"] else "did not improve both measures"
-                self.next_broadcast_result.setText(
-                    f"Next-broadcast result: {outcome}; congestion {'improved' if comparison['congestion_improved'] else 'not improved'}, "
-                    f"skipped frames {'improved' if comparison['skipped_frames_improved'] else 'not improved'} "
-                    f"({metrics['skipped_frames']} in this broadcast)."
-                )
+                if not comparison["sufficient_evidence"]:
+                    self.next_broadcast_result.setText(
+                        "Next-broadcast result: insufficient samples to compare congestion and skipped frames."
+                    )
+                else:
+                    outcome = "improved" if comparison["improved"] else "did not improve both measures"
+                    self.next_broadcast_result.setText(
+                        f"Next-broadcast result: {outcome}; congestion {'improved' if comparison['congestion_improved'] else 'not improved'}, "
+                        f"skipped frames {'improved' if comparison['skipped_frames_improved'] else 'not improved'} "
+                        f"({metrics['skipped_frames']} in this broadcast)."
+                    )
                 self._pending_correction = None
             elif self._pending_correction:
                 self.next_broadcast_result.setText("Next-broadcast result: no earlier broadcast baseline was available for comparison.")
