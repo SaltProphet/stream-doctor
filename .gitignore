@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Build and packaging outputs
+build/
+dist/
+*.spec
+stream_doctor.zip
+
+# Local test/export artifacts
+test-artifacts/
+Exports (do not commit)/
+*.sqlite3
+*.sqlite3-journal
+*.bak
+
+# Local application state
+connection.json
+overlay.json
+
+# IDE/OS files
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
