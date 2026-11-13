@@ -5,12 +5,12 @@ import json
 import os
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 from PySide6.QtCore import QThread, Qt, Signal, QTimer
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QFont
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
+    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QPushButton, QSlider, QSpinBox, QStackedWidget,
     QScrollArea, QSizeGrip, QStyle, QHeaderView, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -533,7 +533,35 @@ class MainWindow(QMainWindow):
         internet_button = QPushButton("Retest Internet upload")
         internet_button.clicked.connect(self._measure_cloudflare_upload)
         layout.addWidget(internet_button)
+        manual = QHBoxLayout()
+        self.manual_upload = QDoubleSpinBox()
+        self.manual_upload.setRange(0, 10000)
+        self.manual_upload.setDecimals(2)
+        self.manual_upload.setSuffix(" Mbps")
+        self.manual_upload.setAccessibleName("Externally measured upload speed")
+        self.manual_upload.setToolTip("Enter a recent upload measurement taken on this computer while OBS was idle.")
+        use_measurement = QPushButton("Use external upload result")
+        use_measurement.clicked.connect(self._use_external_upload)
+        manual.addWidget(self.manual_upload)
+        manual.addWidget(use_measurement)
+        manual.addStretch()
+        layout.addLayout(manual)
         return page
+
+    def _use_external_upload(self) -> None:
+        value = self.manual_upload.value()
+        if value <= 0:
+            self.preflight_summary.setText("Enter a recent upload result in Mbps.")
+            return
+        self._network_measurements.update({
+            "upload_mbps": value,
+            "upload_measured_at": datetime.now(timezone.utc).isoformat(),
+            "upload_source": "External test entered by operator",
+        })
+        self.preflight_summary.setText(
+            f"Using external result: {value:.2f} Mbps. This measures the external test path, which can differ from the broadcast route."
+        )
+        self._refresh_optimizer()
 
     def _open_preflight(self) -> None:
         self._show_screen("Preflight")
@@ -606,8 +634,13 @@ class MainWindow(QMainWindow):
             "latency_ms": quality.latency_ms, "jitter_ms": quality.jitter_ms,
             "tcp_failure_percent": quality.packet_loss_percent,
         })
-        if upload is not None:
-            self._network_measurements.update({"upload_mbps": upload.upload_mbps, "upload_measured_at": upload.measured_at})
+        if upload is not None and upload.upload_mbps is not None:
+            self._network_measurements.update({
+                "upload_mbps": upload.upload_mbps, "upload_measured_at": upload.measured_at,
+                "upload_source": "Cloudflare speed test",
+            })
+        elif self._network_measurements.get("upload_source") == "Cloudflare speed test":
+            self._network_measurements.pop("upload_mbps", None)
         self.preflight_summary.setText(
             detail or f"Internet upload: {upload.upload_mbps:.2f} Mbps across {upload.samples} samples ({upload.bytes_transferred:,} bytes)."
         )
@@ -990,7 +1023,10 @@ class MainWindow(QMainWindow):
         bitrate = f"{obs['bitrate_kbps']} kbps" if obs["bitrate_kbps"] else "Unavailable"
         fps = f"{obs['fps']:g} FPS" if obs["fps"] else "Unavailable FPS"
         upload = measurements["network"]["upload_mbps"]
+        source = self._network_measurements.get("upload_source")
         upload_text = f"{upload:.2f} Mbps" if upload else "Unavailable"
+        if upload and source:
+            upload_text += f" ({source})"
         self.opt_context.setText(
             f"Profile: {profile}  •  Bitrate: {bitrate}  •  Internet upload: {upload_text}\n"
             f"{obs['resolution'] or 'Unavailable resolution'}  •  {fps}  •  Encoder: {obs['encoder'] or 'Unavailable'}"

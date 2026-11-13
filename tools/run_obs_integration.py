@@ -24,7 +24,7 @@ from stream_doctor.obs import ObsClient
 from stream_doctor.reports import export_report
 from stream_doctor.core import IncidentStore
 from stream_doctor.monitoring import BlackoutTracker, LiveMonitor, VideoObservation
-from stream_doctor.optimizer import apply_supported_output_settings, rollback_output_settings
+from stream_doctor.optimizer import change_profile_bitrate, inspect_stream_profile
 from stream_doctor.telemetry import hardware_snapshot
 from stream_doctor.video import FrameAnalyzer, analyze_png_data
 
@@ -46,7 +46,7 @@ async def request_retry(client: ObsClient, request_type: str, request_data: dict
 
 async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
     print("creating disposable OBS profile", flush=True)
-    root = Path(tempfile.mkdtemp(prefix="stream-doctor-obs-test-", dir=r"C:\Users\Shadow\AppData\Local\Temp\opencode"))
+    root = Path(tempfile.mkdtemp(prefix="stream-doctor-obs-test-"))
     staged_obs = root / "obs-studio"
     print("staging OBS installation into disposable directory", flush=True)
     copy = subprocess.run(["robocopy", str(obs_path.parents[2]), str(staged_obs), "/E", "/NFL", "/NDL", "/NJH", "/NJS", "/R:1", "/W:1"], capture_output=True, text=True, timeout=300)
@@ -96,36 +96,28 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             print(json.dumps({"status": "FAILED", "reason": "OBS WebSocket connected but OBS did not become request-ready", "profile": str(root)}))
             return 2
         encoder_capabilities = await client.discover_encoder_capabilities()
-        output_items = (await client.request("GetOutputList")).get("outputs", [])
-        settings_cycle = {"status": "unavailable", "reason": "No OBS output was exposed"}
-        if output_items and output_items[0].get("outputName"):
-            output_name = output_items[0]["outputName"]
-            before_settings = await client.request("GetOutputSettings", {"outputName": output_name})
-            raw_values = dict(before_settings.get("outputSettings", {}))
-            if "bitrate" not in raw_values:
-                await client.request("SetOutputSettings", {"outputName": output_name, "outputSettings": {**raw_values, "bitrate": 1200}})
-                before_settings = await client.request("GetOutputSettings", {"outputName": output_name})
-                raw_values = dict(before_settings.get("outputSettings", {}))
-            original_bitrate = int(raw_values.get("bitrate") or 1200)
-            test_value = 1234 if original_bitrate != 1234 else 1200
-            apply_result = await apply_supported_output_settings(client, output_name, {"bitrate": test_value})
-            after_apply = await client.request("GetOutputSettings", {"outputName": output_name})
-            await rollback_output_settings(client, output_name, apply_result["backup"])
-            after_rollback = await client.request("GetOutputSettings", {"outputName": output_name})
-            settings_cycle = {"status": "PASS", "controlled_test": True, "verified_apply": apply_result["verified"], "applied_bitrate": after_apply.get("outputSettings", {}).get("bitrate"), "restored_bitrate": after_rollback.get("outputSettings", {}).get("bitrate"), "original_bitrate": apply_result["backup"].get("bitrate")}
+        original_config = await inspect_stream_profile(client)
+        profile_name = original_config["profile"]
+        if profile_name != "StreamDoctorTest" or original_config["mode"] != "Simple":
+            raise RuntimeError("Disposable Simple Output profile did not load.")
+        original_bitrate = original_config["bitrate"]
+        test_value = 1234 if original_bitrate != 1234 else 1200
+        applied = await change_profile_bitrate(client, profile_name, original_bitrate, test_value)
+        restored = await change_profile_bitrate(client, profile_name, test_value, original_bitrate)
+        settings_cycle = {"status": "PASS", "controlled_test": True, "verified_apply": True,
+                          "applied_bitrate": applied["bitrate"], "restored_bitrate": restored["bitrate"],
+                          "original_bitrate": original_bitrate}
         scene = await request_retry(client, "CreateScene", {"sceneName": "StreamDoctorTestScene"})
         await request_retry(client, "CreateInput", {"sceneName": "StreamDoctorTestScene", "inputName": "StreamDoctorColor", "inputKind": "color_source_v3", "inputSettings": {"color": 4278190335, "width": 640, "height": 360}, "sceneItemEnabled": True})
         await request_retry(client, "SetCurrentProgramScene", {"sceneName": "StreamDoctorTestScene"})
         active_output_samples = []
         if active_output:
-            async def hold_rtmp(reader, writer):
-                try:
-                    while await reader.read(65536):
-                        pass
-                finally:
-                    writer.close()
-                    await writer.wait_closed()
-            local_output_server = await asyncio.start_server(hold_rtmp, "127.0.0.1", 19350)
+            local_output_server = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-listen", "1", "-i", "rtmp://127.0.0.1:19350/live/stream-doctor-local",
+                "-f", "null", "-", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            await asyncio.sleep(1)
             await request_retry(client, "SetStreamServiceSettings", {"streamServiceType": "rtmp_custom", "streamServiceSettings": {"server": "rtmp://127.0.0.1:19350/live", "key": "stream-doctor-local"}})
             await request_retry(client, "StartStream")
             for _ in range(20):
@@ -134,6 +126,8 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
                 if status.get("outputActive"):
                     break
                 await asyncio.sleep(0.25)
+            if not any(active_output_samples):
+                raise RuntimeError("Disposable RTMP output did not become active.")
         snapshot = await client.snapshot()
         analyzer = FrameAnalyzer(freeze_samples=3)
         blackout_store = IncidentStore(root / "blackout-incidents.sqlite3")
@@ -157,7 +151,7 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
         incident_store = IncidentStore(root / "incidents.sqlite3")
         monitor = LiveMonitor(lambda: client, incident_store, interval=0.2)
         if active_output:
-            monitor_task = asyncio.create_task(monitor.run(max_samples=15))
+            monitor_task = asyncio.create_task(monitor.run(max_samples=40))
             await asyncio.sleep(0.8)
             await request_retry(client, "SetInputSettings", {"inputName": "StreamDoctorColor", "inputSettings": {"color": 0}, "overlay": False})
             await asyncio.sleep(3.0)
@@ -167,7 +161,7 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             await monitor.run(max_samples=3)
         await client.connect()
         recovery = await request_retry(client, "GetVersion")
-        result = {"status": "PASS", "authenticated": authentication_enforced, "identified": identified, "identified_observation": "OBS WebSocket 5.x accepted the configured test password and rejected an incorrect password", "version": version, "encoder_capabilities": encoder_capabilities, "settings_cycle": settings_cycle, "active_output": active_output, "active_output_samples": active_output_samples, "active_monitor_records": sum(1 for record in monitor.records if record["sample"]["stream_active"]), "websocket_recovery": {"verified": bool(recovery.get("obsVersion")), "version": recovery.get("obsVersion")}, "monitoring_records": monitor.records, "incident_count": len(incident_store.search()), "scene_created": bool(scene is not None), "screenshot_dimensions": [image.width(), image.height()], "frame_observations": observations, "blackout_events": blackout_events, "blackout_incidents": blackout_store.search(), "hardware": hardware_snapshot()}
+        result = {"status": "PASS", "authenticated": authentication_enforced, "identified": identified, "identified_observation": "OBS WebSocket 5.x accepted the configured test password and rejected an incorrect password", "version": version, "encoder_capabilities": encoder_capabilities, "settings_cycle": settings_cycle, "active_output": active_output, "active_output_samples": active_output_samples, "active_monitor_records": sum(1 for record in monitor.records if record.get("sample", {}).get("stream_active")), "websocket_recovery": {"verified": bool(recovery.get("obsVersion")), "version": recovery.get("obsVersion")}, "monitoring_records": monitor.records, "incident_count": len(incident_store.search()), "scene_created": bool(scene is not None), "screenshot_dimensions": [image.width(), image.height()], "frame_observations": observations, "blackout_events": blackout_events, "blackout_incidents": blackout_store.search(), "hardware": hardware_snapshot()}
         report_path = root / "stream-doctor-obs-report.json"
         export_report(result, report_path, "json")
         print(json.dumps({**result, "report": str(report_path)}, indent=2, default=str))
@@ -179,8 +173,9 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             except Exception:
                 pass
         if local_output_server is not None:
-            local_output_server.close()
-            await local_output_server.wait_closed()
+            if local_output_server.returncode is None:
+                local_output_server.terminate()
+            await local_output_server.wait()
         await client.close()
         process.terminate()
         try:

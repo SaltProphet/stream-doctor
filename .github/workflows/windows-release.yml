@@ -61,3 +61,17 @@ jobs:
             dist/StreamDoctor/
             installer-output/StreamDoctor-Setup-*.exe
           if-no-files-found: error
+
+  disposable-obs:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install .
+      - name: Install OBS Studio and FFmpeg
+        run: choco install obs-studio ffmpeg -y --no-progress
+      - name: Verify disposable OBS profile and local RTMP output
+        run: python -m tools.run_obs_integration --active-output
