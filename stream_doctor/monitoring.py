@@ -71,6 +71,8 @@ class MonitorSample:
     encoding_lag_ms: float | None
     network_loss_percent: float | None
     output_congestion: float | None = None
+    new_skipped_frames: int | None = None
+    congestion_samples: int = 0
 
 
 @dataclass(frozen=True)
@@ -151,10 +153,10 @@ def diagnose_sample(sample: MonitorSample) -> Diagnosis:
         return Diagnosis("rendering", f"Rendering lag is {sample.render_lag_ms:.1f} ms, indicating render pressure.", "Reduce scene/rendering load.")
     if sample.network_loss_percent is not None and sample.network_loss_percent >= 1:
         return Diagnosis("network", f"Dropped frames coincide with measured network loss of {sample.network_loss_percent:.1f}%.", "Investigate the active adapter or reduce bitrate.")
-    if sample.output_congestion is not None and sample.output_congestion >= 0.5:
-        return Diagnosis("network", f"OBS reports {sample.output_congestion:.0%} output congestion.", "Check upload stability and run Preflight when idle to evaluate a lower bitrate.")
-    if sample.dropped_frames and sample.total_frames and sample.dropped_frames / sample.total_frames >= 0.01:
-        return Diagnosis("output", f"OBS reports {sample.dropped_frames} dropped frames out of {sample.total_frames}; cause is not isolated.", "Collect more samples before changing settings.")
+    if sample.output_congestion is not None and sample.output_congestion >= 0.5 and sample.congestion_samples >= 3:
+        return Diagnosis("network", f"OBS reports {sample.output_congestion:.0%} output congestion across {sample.congestion_samples} consecutive samples.", "Check upload stability and run Preflight when idle to evaluate a lower bitrate.")
+    if sample.new_skipped_frames is not None and sample.new_skipped_frames > 0:
+        return Diagnosis("output", f"OBS skipped {sample.new_skipped_frames} output frames since the previous sample. The cause is undetermined.", "Collect more samples before changing settings.")
     return Diagnosis("healthy", "No threshold breach is present in this sample.", "Continue monitoring.")
 
 
@@ -220,6 +222,9 @@ class LiveMonitor:
         self._was_reconnecting = False
         self._broadcast_started_at: float | None = None
         self._has_observed_state = False
+        self._previous_skipped = None
+        self._congestion_samples = 0
+        self._last_diagnosis = None
 
     async def run(self, max_samples: int | None = None) -> None:
         client = self.client_factory()
@@ -233,6 +238,19 @@ class LiveMonitor:
                     timestamp = datetime.now(timezone.utc).isoformat()
                     snapshot = await client.snapshot()
                     sample = sample_from_obs(snapshot.get("stats", {}), snapshot.get("stream", {}), self.network_loss_provider(), timestamp)
+                    if sample.stream_active and not sample.reconnecting:
+                        skipped = sample.dropped_frames
+                        previous = self._previous_skipped
+                        delta = skipped - previous if skipped is not None and previous is not None and skipped >= previous else None
+                        self._previous_skipped = skipped
+                        if sample.output_congestion is not None and sample.output_congestion >= 0.5:
+                            self._congestion_samples += 1
+                        else:
+                            self._congestion_samples = 0
+                        sample = replace(sample, new_skipped_frames=delta, congestion_samples=self._congestion_samples)
+                    else:
+                        self._previous_skipped = None
+                        self._congestion_samples = 0
                     now = time.monotonic()
                     current_bytes = snapshot.get("stream", {}).get("outputBytes")
                     sample = replace(sample, bitrate_kbps=derive_bitrate_kbps(self._previous_bytes, current_bytes, now - self._previous_time) if self._previous_time is not None else None)
@@ -278,11 +296,15 @@ class LiveMonitor:
                     self._was_active = sample.stream_active
                     self._was_reconnecting = sample.reconnecting
                     self._has_observed_state = True
-                    if diagnosis.category not in ("healthy", "unknown"):
+                    if diagnosis.category not in ("healthy", "unknown") and diagnosis.category != self._last_diagnosis:
                         self.incident_store.record(diagnosis.category, diagnosis.explanation, {"timestamp": timestamp, "sample": sample.__dict__, "next_action": diagnosis.next_action})
+                    self._last_diagnosis = diagnosis.category
                     await asyncio.sleep(self.interval)
                 except Exception as exc:
                     self.reconnections += 1
+                    self._previous_skipped = None
+                    self._congestion_samples = 0
+                    self._last_diagnosis = None
                     self._previous_bytes = self._previous_time = None
                     self.blackout_tracker.interrupt(datetime.now(timezone.utc).isoformat(), "OBS connection interrupted")
                     if self.on_sample:
