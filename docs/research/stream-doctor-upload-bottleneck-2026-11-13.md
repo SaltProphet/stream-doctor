@@ -47,13 +47,36 @@ An independent local probe accepted a generated H.264/AAC RTMP publisher and
 reported 40 video frames over four seconds. This isolates the failure to OBS
 output initialization, not the receiver or loopback RTMP handshake.
 
+## Auto-Configuration Wizard fix
+
+OBS 33.0.1's fresh portable configuration queued the first-run wizard, which
+left outputs disabled while `StartStream` returned successfully. The harness
+now preserves the disposable `user.ini` and ensures:
+
+```ini
+[General]
+FirstRun=true
+```
+
+The uncapped baseline then passed from a fixed runtime path:
+
+- Runtime: `%TEMP%\stream-doctor-obs-test\obs-studio`
+- OBS state events: `OBS_WEBSOCKET_OUTPUT_STARTING`, `OBS_WEBSOCKET_OUTPUT_STARTED`
+- Active output samples: 5
+- OBS output bytes: `0 -> 0 -> 0 -> 0 -> 2223`
+- FFmpeg media: 467 frames and 28 media-progress records
+
+The harness resets only the disposable configuration/log directory before each
+run and keeps the staged executable at the fixed runtime path. WebSocket and
+RTMP endpoints remain loopback-bound to `127.0.0.1`.
+
 The harness also had a direct-execution import defect: invoking
 `python tools/run_obs_integration.py` selected an installed stale
 `stream_doctor` package. The worktree now prepends its repository root before
 imports, covered by `tests/test_tools_import.py`.
 
-## Next required baseline step
+## Next research step
 
-Do not add a bandwidth cap yet. First make the disposable profile expose a real
-stream output, then require continuous receiver media plus increasing OBS output
-bytes before measuring any bottleneck or applying a correction.
+The publishing baseline is now established. A bandwidth-cap experiment may be
+added as a separate controlled phase, followed by the bitrate comparison; no
+such cap or correction is included in this baseline run.

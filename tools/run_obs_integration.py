@@ -102,18 +102,49 @@ def latest_obs_log(config: Path) -> str:
     return redact_text(logs[-1].read_text(encoding="utf-8", errors="replace")[-12000:])
 
 
+def ensure_first_run_enabled(user_ini: Path) -> None:
+    """Enable OBS's first-run wizard without discarding existing user.ini settings."""
+    text = user_ini.read_text(encoding="utf-8") if user_ini.exists() else ""
+    lines = text.splitlines(keepends=True)
+    general_start = next((index for index, line in enumerate(lines) if line.strip().lower() == "[general]"), None)
+    if general_start is None:
+        prefix = "" if not text or text.endswith(("\n", "\r")) else "\n"
+        user_ini.write_text(f"{text}{prefix}[General]\nFirstRun=true\n", encoding="utf-8")
+        return
+
+    general_end = next(
+        (index for index in range(general_start + 1, len(lines)) if lines[index].lstrip().startswith("[")),
+        len(lines),
+    )
+    for index in range(general_start + 1, general_end):
+        if lines[index].split(";", 1)[0].split("#", 1)[0].strip().lower().startswith("firstrun="):
+            newline = "\r\n" if lines[index].endswith("\r\n") else "\n"
+            lines[index] = f"FirstRun=true{newline}"
+            user_ini.write_text("".join(lines), encoding="utf-8")
+            return
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    lines.insert(general_end, f"FirstRun=true{newline}")
+    user_ini.write_text("".join(lines), encoding="utf-8")
+
+
 async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
     print("creating disposable OBS profile", flush=True)
-    root = Path(tempfile.mkdtemp(prefix="stream-doctor-obs-test-"))
+    root = Path(tempfile.gettempdir()) / "stream-doctor-obs-test"
     staged_obs = root / "obs-studio"
-    print("staging OBS installation into disposable directory", flush=True)
-    copy = subprocess.run(["robocopy", str(obs_path.parents[2]), str(staged_obs), "/E", "/NFL", "/NDL", "/NJH", "/NJS", "/R:1", "/W:1"], capture_output=True, text=True, timeout=300)
-    if copy.returncode > 7:
-        print(json.dumps({"status": "FAILED", "reason": "Could not stage OBS installation", "detail": copy.stderr}))
-        return 2
+    if not (staged_obs / "bin" / "64bit" / obs_path.name).exists():
+        print("staging OBS installation into fixed disposable directory", flush=True)
+        root.mkdir(parents=True, exist_ok=True)
+        copy = subprocess.run(["robocopy", str(obs_path.parents[2]), str(staged_obs), "/E", "/NFL", "/NDL", "/NJH", "/NJS", "/R:1", "/W:1"], capture_output=True, text=True, timeout=300)
+        if copy.returncode > 7:
+            print(json.dumps({"status": "FAILED", "reason": "Could not stage OBS installation", "detail": copy.stderr}))
+            return 2
+    else:
+        print("reusing fixed disposable OBS executable", flush=True)
     (staged_obs / "portable_mode.txt").write_text("", encoding="utf-8")
     config = staged_obs / "config" / "obs-studio"
+    shutil.rmtree(config, ignore_errors=True)
     config.mkdir(parents=True)
+    ensure_first_run_enabled(config / "user.ini")
     test_password = "stream-doctor-local-test-password"
     (config / "global.ini").write_text(f"[OBSWebSocket]\nServerEnabled=true\nServerPort=4456\nAuthRequired=true\nServerPassword={test_password}\n", encoding="utf-8")
     profile = config / "basic" / "profiles" / "StreamDoctorTest"
@@ -216,10 +247,13 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             })
             start_request = {"timestamp": utc_now(), "request": "StartStream"}
             start_request["response"] = await client.request("StartStream")
+            active_seen = False
             for _ in range(80):
                 status = await client.request("GetStreamStatus")
                 active_output_samples.append({"timestamp": utc_now(), "status": status})
                 if status.get("outputActive"):
+                    active_seen = True
+                if active_seen and len(active_output_samples) >= 5:
                     break
                 await asyncio.sleep(0.25)
             publish_trace = {
@@ -235,10 +269,16 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
                 "ffmpeg_trace": ffmpeg_trace,
                 "ffmpeg_media_progress": ffmpeg_media_progress,
             }
-            if not any(sample["status"].get("outputActive") for sample in active_output_samples):
+            byte_samples = [sample["status"].get("outputBytes", 0) for sample in active_output_samples if sample["status"].get("outputActive")]
+            bytes_advanced = any(current > previous for previous, current in zip(byte_samples, byte_samples[1:]))
+            if not active_seen:
                 (root / "publish-diagnostics.json").write_text(json.dumps(publish_trace, indent=2), encoding="utf-8")
                 print(json.dumps({"publish_diagnostics": str(root / "publish-diagnostics.json")}, indent=2), flush=True)
                 raise RuntimeError("Disposable RTMP output did not become active.")
+            if not bytes_advanced:
+                (root / "publish-diagnostics.json").write_text(json.dumps(publish_trace, indent=2), encoding="utf-8")
+                print(json.dumps({"publish_diagnostics": str(root / "publish-diagnostics.json")}, indent=2), flush=True)
+                raise RuntimeError("OBS output bytes did not advance across consecutive active samples.")
         snapshot = await client.snapshot()
         analyzer = FrameAnalyzer(freeze_samples=3)
         blackout_store = IncidentStore(root / "blackout-incidents.sqlite3")
@@ -283,15 +323,15 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
         await client.connect()
         recovery = await request_retry(client, "GetVersion")
         receiver_media_observed = bool(
-            int(receiver_progress.get("frame", "0") or 0) > 0
-            or int(receiver_progress.get("out_time_ms", "0") or 0) > 0
+            int(ffmpeg_progress.get("frame", "0") or 0) > 0
+            or int(ffmpeg_progress.get("out_time_ms", "0") or 0) > 0
         )
         if active_output and not receiver_media_observed:
             raise RuntimeError("Local RTMP receiver did not report decoded media.")
         result = {"status": "PASS", "authenticated": authentication_enforced, "identified": identified, "identified_observation": "OBS WebSocket 5.x accepted the configured test password and rejected an incorrect password", "version": version, "encoder_capabilities": encoder_capabilities, "settings_cycle": settings_cycle, "active_output": active_output, "active_output_samples": active_output_samples, "active_monitor_records": sum(1 for record in monitor.records if record.get("sample", {}).get("stream_active")), "websocket_recovery": {"verified": bool(recovery.get("obsVersion")), "version": recovery.get("obsVersion")}, "monitoring_records": monitor.records, "incident_count": len(incident_store.search()), "scene_created": bool(scene is not None), "screenshot_dimensions": [image.width(), image.height()], "frame_observations": observations, "blackout_events": blackout_events, "blackout_incidents": blackout_store.search(), "hardware": hardware_snapshot()}
         result["receiver"] = {
             "media_observed": receiver_media_observed,
-            "progress": receiver_progress,
+            "progress": ffmpeg_progress,
             "trace": ffmpeg_trace,
             "media_progress": ffmpeg_media_progress,
         }
@@ -322,10 +362,7 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
-        if keep:
-            print(f"Test profile retained at {root}")
-        else:
-            shutil.rmtree(root, ignore_errors=True)
+        print(f"Fixed disposable OBS runtime retained at {root}")
 
 
 def main() -> int:
