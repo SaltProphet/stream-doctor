@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
@@ -721,6 +722,13 @@ class MainWindow(QMainWindow):
         export = QPushButton("Export report")
         export.clicked.connect(self._export_report)
         layout.addWidget(export)
+        self.clear_history_button = QPushButton("Clear incident history")
+        self.clear_history_button.setToolTip("Stop monitoring before clearing saved incidents and events.")
+        self.clear_history_button.clicked.connect(self._clear_incident_history)
+        layout.addWidget(self.clear_history_button)
+        self.incident_status = QLabel("")
+        self.incident_status.setWordWrap(True)
+        layout.addWidget(self.incident_status)
         self._refresh_incidents()
         return page
 
@@ -743,6 +751,27 @@ class MainWindow(QMainWindow):
             evidence = QTableWidgetItem(str(ev)[:80])
             evidence.setToolTip(json.dumps(ev, indent=2))
             self.inc_table.setItem(i, 5, evidence)
+
+    def _clear_incident_history(self) -> None:
+        if self.worker is not None:
+            return
+        choice = QMessageBox.question(
+            self, "Clear incident history",
+            "Permanently delete all saved incidents and events from Stream Doctor? "
+            "Export a report first if you want to keep a copy.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes or self.worker is not None:
+            return
+        try:
+            count = self.store.clear()
+        except sqlite3.Error as exc:
+            self.incident_status.setText(f"Could not clear history: {exc}")
+            return
+        self.last_record = {}
+        self._refresh_incidents()
+        self.incident_status.setText(f"Cleared {count} saved records.")
 
     def _export_report(self) -> None:
         report = {
@@ -917,6 +946,8 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._monitor_finished)
         self.health_status.setText("Monitoring: Starting…")
         self.monitor_button.setText("Stop monitoring")
+        self.clear_history_button.setEnabled(False)
+        self.incident_status.clear()
         self.worker.start()
         if self.overlay_enabled.isChecked():
             self.overlay.show()
@@ -930,6 +961,7 @@ class MainWindow(QMainWindow):
     def _monitor_finished(self) -> None:
         self.worker.deleteLater()
         self.worker = None
+        self.clear_history_button.setEnabled(True)
         self.last_record = {}
         self.monitor_button.setText("Start monitoring")
         self.monitor_button.setEnabled(True)

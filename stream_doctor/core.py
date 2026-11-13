@@ -75,6 +75,10 @@ class IncidentStore:
                 merged.update(evidence)
             db.execute("UPDATE incidents SET end_timestamp = ?, duration_seconds = ?, recovery_status = ?, evidence = ? WHERE id = ?", (end_timestamp, duration_seconds, recovery_status, json.dumps(merged), incident_id))
 
+    def clear(self) -> int:
+        with sqlite3.connect(self.path) as db:
+            return db.execute("DELETE FROM incidents").rowcount
+
     def search(self, query: str = "") -> list[dict[str, Any]]:
         with sqlite3.connect(self.path) as db:
             rows = db.execute("SELECT id, timestamp, category, summary, evidence, end_timestamp, duration_seconds, recovery_status FROM incidents WHERE summary LIKE ? OR category LIKE ? ORDER BY id DESC", (f"%{query}%", f"%{query}%")).fetchall()

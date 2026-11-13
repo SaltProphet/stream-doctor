@@ -184,3 +184,33 @@ def test_optimizer_preserves_preflight_upload_when_live_samples_arrive():
     assert not window.opt_apply.isEnabled()
     window.overlay.close()
     window.close()
+
+
+def test_clear_history_removes_old_rows_from_next_export(monkeypatch, tmp_path):
+    import json
+    from PySide6.QtWidgets import QMessageBox
+    from stream_doctor.core import IncidentStore
+
+    _app()
+    window = MainWindow()
+    window.store = IncidentStore(tmp_path / "incidents.sqlite3")
+    window.store.record("blackout", "Old test blackout", {})
+    window.store.record("session", "Old session", {})
+    window.last_record = {"video_event": {"incident_id": 1}}
+    window._refresh_incidents()
+    choices = iter([QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes])
+    monkeypatch.setattr("stream_doctor.app.QMessageBox.question", lambda *args: next(choices))
+    window.clear_history_button.click()
+    assert window.inc_table.rowCount() == 2
+    window.clear_history_button.click()
+    assert window.inc_table.rowCount() == 0
+    assert IncidentStore(window.store.path).search() == []
+    window.store.record("session", "New session", {})
+    output = tmp_path / "report.json"
+    monkeypatch.setattr("stream_doctor.app.QFileDialog.getSaveFileName", lambda *args: (str(output), "JSON"))
+    monkeypatch.setattr("stream_doctor.app.QMessageBox.information", lambda *args: None)
+    window._export_report()
+    report = json.loads(output.read_text())
+    assert report["latest_sample"] == {}
+    assert [row["summary"] for row in report["incidents"]] == ["New session"]
+    window.close()
