@@ -33,6 +33,20 @@ disposable profile is not materializing a streaming output under this OBS
 version/configuration, even though `GetStreamServiceSettings` reports the
 expected custom RTMP service and `StartStream` returns an empty success response.
 
+The follow-up trace records the same boundary with event and receiver evidence:
+
+- `StartStream` response: `{}`
+- `StreamStateChanged` events: `0`
+- FFmpeg trace lines: listener startup only; no publisher accept line
+- FFmpeg media-progress records: `0`
+- OBS outputs before start: `simple_file_output` and `virtualcam_output` only
+- `OBS_OUTPUT_SERVICE` on both outputs: `false`
+- OBS current encoder setting: unavailable because no service output exists
+
+An independent local probe accepted a generated H.264/AAC RTMP publisher and
+reported 40 video frames over four seconds. This isolates the failure to OBS
+output initialization, not the receiver or loopback RTMP handshake.
+
 The harness also had a direct-execution import defect: invoking
 `python tools/run_obs_integration.py` selected an installed stale
 `stream_doctor` package. The worktree now prepends its repository root before

@@ -38,7 +38,28 @@ async def test_obs_websocket_5_handshake_and_request(monkeypatch):
     response = await client.request("GetStats")
     assert response["cpuUsage"] == 2.5
     assert socket.sent[0]["op"] == 1
+    assert socket.sent[0]["d"]["eventSubscriptions"] == 64
     assert socket.sent[1]["d"]["requestType"] == "GetStats"
+
+
+@pytest.mark.asyncio
+async def test_output_events_are_retained_while_waiting_for_request(monkeypatch):
+    socket = FakeSocket()
+    socket.incoming = [
+        json.dumps({"op": 0, "d": {"rpcVersion": 1}}),
+        json.dumps({"op": 2, "d": {"negotiatedRpcVersion": 1}}),
+        json.dumps({"op": 5, "d": {"eventType": "StreamStateChanged", "eventData": {"outputActive": True}}}),
+        json.dumps({"op": 7, "d": {"requestId": "1", "requestStatus": {"result": True}, "responseData": {"ok": True}}}),
+    ]
+
+    async def connect(*args, **kwargs):
+        return socket
+
+    monkeypatch.setattr("stream_doctor.obs.websockets.connect", connect)
+    client = ObsClient()
+    await client.connect()
+    assert await client.request("StartStream") == {"ok": True}
+    assert client.events == [{"eventType": "StreamStateChanged", "eventData": {"outputActive": True}}]
 
 
 @pytest.mark.asyncio

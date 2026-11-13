@@ -70,6 +70,38 @@ async def wait_for_receiver(process: asyncio.subprocess.Process, port: int, time
     raise TimeoutError(f"Local RTMP receiver did not listen on port {port}.")
 
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def redact_text(value: str) -> str:
+    return value.replace("stream-doctor-local-test-password", "<test-password>").replace(
+        "stream-doctor-local", "<test-key>"
+    )
+
+
+async def capture_ffmpeg_stream(stream, kind: str, trace: list[dict], progress: dict, media_progress: list[dict]) -> None:
+    while True:
+        raw = await stream.readline()
+        if not raw:
+            return
+        text = redact_text(raw.decode(errors="replace").rstrip())
+        timestamp = utc_now()
+        trace.append({"timestamp": timestamp, "stream": kind, "line": text})
+        if kind == "progress" and "=" in text:
+            key, value = text.split("=", 1)
+            progress[key] = value
+            if key in {"frame", "out_time_ms"} and value not in {"0", "-1", "N/A"}:
+                media_progress.append({"timestamp": timestamp, key: value})
+
+
+def latest_obs_log(config: Path) -> str:
+    logs = sorted((config / "logs").glob("*.txt"), key=lambda path: path.stat().st_mtime)
+    if not logs:
+        return ""
+    return redact_text(logs[-1].read_text(encoding="utf-8", errors="replace")[-12000:])
+
+
 async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
     print("creating disposable OBS profile", flush=True)
     root = Path(tempfile.mkdtemp(prefix="stream-doctor-obs-test-"))
@@ -102,7 +134,10 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
     authentication_enforced = False
     local_output_server = None
     ffmpeg_log = None
-    ffmpeg_progress = None
+    ffmpeg_tasks = []
+    ffmpeg_trace = []
+    ffmpeg_progress = {}
+    ffmpeg_media_progress = []
     try:
         for _ in range(20):
             try:
@@ -148,19 +183,30 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
         await request_retry(client, "SetCurrentProgramScene", {"sceneName": "StreamDoctorTestScene"})
         active_output_samples = []
         if active_output:
-            ffmpeg_log = (root / "ffmpeg.log").open("w+b")
-            ffmpeg_progress = root / "ffmpeg-progress.txt"
             local_output_server = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info", "-stats_period", "1",
                 "-listen", "1", "-i", "rtmp://127.0.0.1:19350/live/stream-doctor-local",
-                "-progress", str(ffmpeg_progress),
-                "-c", "copy", "-f", "null", "-", stdout=subprocess.DEVNULL, stderr=ffmpeg_log,
+                "-progress", "pipe:1",
+                "-c", "copy", "-f", "null", "-", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
+            ffmpeg_tasks = [
+                asyncio.create_task(capture_ffmpeg_stream(local_output_server.stdout, "progress", ffmpeg_trace, ffmpeg_progress, ffmpeg_media_progress)),
+                asyncio.create_task(capture_ffmpeg_stream(local_output_server.stderr, "stderr", ffmpeg_trace, ffmpeg_progress, ffmpeg_media_progress)),
+            ]
             await wait_for_receiver(local_output_server, 19350)
             service = await client.request("GetStreamServiceSettings")
             configured = service.get("streamServiceSettings", {})
             if service.get("streamServiceType") != "rtmp_custom" or configured.get("server") != "rtmp://127.0.0.1:19350/live":
                 raise RuntimeError("Disposable OBS did not load its loopback RTMP service.")
+            output_inventory_before = await client.request("GetOutputList")
+            output_status_before = []
+            for output in output_inventory_before.get("outputs", []):
+                output_name = output.get("outputName")
+                if output_name:
+                    output_status_before.append({
+                        "outputName": output_name,
+                        "status": await client.request("GetOutputStatus", {"outputName": output_name}),
+                    })
             await client.request("SetStreamServiceSettings", {
                 "streamServiceType": "rtmp_custom",
                 "streamServiceSettings": {
@@ -168,19 +214,30 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
                     "key": "stream-doctor-local",
                 },
             })
-            await client.request("StartStream")
+            start_request = {"timestamp": utc_now(), "request": "StartStream"}
+            start_request["response"] = await client.request("StartStream")
             for _ in range(80):
                 status = await client.request("GetStreamStatus")
-                active_output_samples.append(bool(status.get("outputActive")))
+                active_output_samples.append({"timestamp": utc_now(), "status": status})
                 if status.get("outputActive"):
                     break
                 await asyncio.sleep(0.25)
-            if not any(active_output_samples):
-                ffmpeg_log.seek(0)
-                print(ffmpeg_log.read().decode(errors="replace"), flush=True)
-                logs = sorted((config / "logs").glob("*.txt"), key=lambda path: path.stat().st_mtime)
-                if logs:
-                    print(logs[-1].read_text(encoding="utf-8", errors="replace")[-9000:], flush=True)
+            publish_trace = {
+                "start_request": start_request,
+                "obs_events": client.event_log,
+                "obs_samples": active_output_samples,
+                "service": {"type": service.get("streamServiceType"), "server": configured.get("server")},
+                "outputs_before_start": output_inventory_before,
+                "output_status_before_start": output_status_before,
+                "encoder_capabilities": encoder_capabilities,
+                "profile_config": redact_text((profile / "basic.ini").read_text(encoding="utf-8", errors="replace")),
+                "obs_log": latest_obs_log(config),
+                "ffmpeg_trace": ffmpeg_trace,
+                "ffmpeg_media_progress": ffmpeg_media_progress,
+            }
+            if not any(sample["status"].get("outputActive") for sample in active_output_samples):
+                (root / "publish-diagnostics.json").write_text(json.dumps(publish_trace, indent=2), encoding="utf-8")
+                print(json.dumps({"publish_diagnostics": str(root / "publish-diagnostics.json")}, indent=2), flush=True)
                 raise RuntimeError("Disposable RTMP output did not become active.")
         snapshot = await client.snapshot()
         analyzer = FrameAnalyzer(freeze_samples=3)
@@ -225,12 +282,6 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             await monitor.run(max_samples=3)
         await client.connect()
         recovery = await request_retry(client, "GetVersion")
-        receiver_progress = {}
-        if ffmpeg_progress is not None and ffmpeg_progress.exists():
-            for line in ffmpeg_progress.read_text(encoding="utf-8", errors="replace").splitlines():
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    receiver_progress[key] = value
         receiver_media_observed = bool(
             int(receiver_progress.get("frame", "0") or 0) > 0
             or int(receiver_progress.get("out_time_ms", "0") or 0) > 0
@@ -238,7 +289,13 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
         if active_output and not receiver_media_observed:
             raise RuntimeError("Local RTMP receiver did not report decoded media.")
         result = {"status": "PASS", "authenticated": authentication_enforced, "identified": identified, "identified_observation": "OBS WebSocket 5.x accepted the configured test password and rejected an incorrect password", "version": version, "encoder_capabilities": encoder_capabilities, "settings_cycle": settings_cycle, "active_output": active_output, "active_output_samples": active_output_samples, "active_monitor_records": sum(1 for record in monitor.records if record.get("sample", {}).get("stream_active")), "websocket_recovery": {"verified": bool(recovery.get("obsVersion")), "version": recovery.get("obsVersion")}, "monitoring_records": monitor.records, "incident_count": len(incident_store.search()), "scene_created": bool(scene is not None), "screenshot_dimensions": [image.width(), image.height()], "frame_observations": observations, "blackout_events": blackout_events, "blackout_incidents": blackout_store.search(), "hardware": hardware_snapshot()}
-        result["receiver"] = {"media_observed": receiver_media_observed, "progress": receiver_progress}
+        result["receiver"] = {
+            "media_observed": receiver_media_observed,
+            "progress": receiver_progress,
+            "trace": ffmpeg_trace,
+            "media_progress": ffmpeg_media_progress,
+        }
+        result["obs_events"] = client.event_log
         report_path = root / "stream-doctor-obs-report.json"
         export_report(result, report_path, "json")
         print(json.dumps({**result, "report": str(report_path)}, indent=2, default=str))
@@ -253,8 +310,12 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             if local_output_server.returncode is None:
                 local_output_server.terminate()
             await local_output_server.wait()
-        if ffmpeg_log is not None:
-            ffmpeg_log.close()
+        if local_output_server is not None:
+            for task in ffmpeg_tasks:
+                if not task.done():
+                    task.cancel()
+            if ffmpeg_tasks:
+                await asyncio.gather(*ffmpeg_tasks, return_exceptions=True)
         await client.close()
         process.terminate()
         try:

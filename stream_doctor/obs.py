@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 import websockets
@@ -15,18 +16,25 @@ class ObsConnectionError(RuntimeError):
 
 class ObsClient:
     """Small OBS WebSocket 5.x client using the documented hello/identify flow."""
+    OUTPUT_EVENT_SUBSCRIPTIONS = 64
+
     def __init__(self, url: str = "ws://127.0.0.1:4455", password: str | None = None, request_timeout: float = 10.0):
         self.url, self.password, self.socket = url, password, None
         self.request_timeout = request_timeout
         self._counter = 0
         self._request_lock = asyncio.Lock()
+        self.events: list[dict[str, Any]] = []
+        self.event_log: list[dict[str, Any]] = []
 
     async def connect(self) -> dict[str, Any]:
         try:
             self.socket = await websockets.connect(self.url, subprotocols=["obswebsocket.json"], open_timeout=self.request_timeout, close_timeout=2)
             hello = json.loads(await asyncio.wait_for(self.socket.recv(), timeout=self.request_timeout))
             data = hello["d"]
-            identify: dict[str, Any] = {"rpcVersion": data.get("rpcVersion", 1)}
+            identify: dict[str, Any] = {
+                "rpcVersion": data.get("rpcVersion", 1),
+                "eventSubscriptions": self.OUTPUT_EVENT_SUBSCRIPTIONS,
+            }
             auth = data.get("authentication")
             if auth and self.password is not None:
                 secret = base64.b64encode(hashlib.sha256((self.password + auth["salt"]).encode()).digest()).decode()
@@ -48,6 +56,14 @@ class ObsClient:
             await self.socket.send(json.dumps({"op": 6, "d": {"requestType": request_type, "requestId": request_id, "requestData": request_data or {}}}))
             while True:
                 response = json.loads(await asyncio.wait_for(self.socket.recv(), timeout=self.request_timeout))
+                if response.get("op") == 5:
+                    event = response.get("d", {})
+                    self.events.append(event)
+                    self.event_log.append({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "event": event,
+                    })
+                    continue
                 if response.get("op") == 7 and response["d"].get("requestId") == request_id:
                     data = response["d"]
                     if not data.get("requestStatus", {}).get("result", False):
