@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - codex/stream-doctor-functional-release
+      - main
 
 jobs:
   windows:
