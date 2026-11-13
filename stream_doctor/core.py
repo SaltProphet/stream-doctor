@@ -34,8 +34,8 @@ class RecommendationEngine:
             return []
         recommendations = []
         current = float(obs.get("bitrate_kbps") or 0)
-        safe = int(upload * 1000 * 0.70)
-        if current > safe:
+        safe = int(upload * 1000 * 0.70) // 50 * 50
+        if 0 < safe < current:
             recommendations.append({"setting": "bitrate_kbps", "current": current, "recommended": safe, "reason": "Measured upload capacity leaves a 30% stability margin."})
         if obs.get("fps") == 60 and upload < 6:
             recommendations.append({"setting": "fps", "current": 60, "recommended": 30, "reason": "Measured upload capacity is below the conservative 60 FPS threshold."})

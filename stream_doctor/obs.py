@@ -23,8 +23,8 @@ class ObsClient:
 
     async def connect(self) -> dict[str, Any]:
         try:
-            self.socket = await websockets.connect(self.url, subprotocols=["obswebsocket.json"])
-            hello = json.loads(await self.socket.recv())
+            self.socket = await websockets.connect(self.url, subprotocols=["obswebsocket.json"], open_timeout=self.request_timeout, close_timeout=2)
+            hello = json.loads(await asyncio.wait_for(self.socket.recv(), timeout=self.request_timeout))
             data = hello["d"]
             identify: dict[str, Any] = {"rpcVersion": data.get("rpcVersion", 1)}
             auth = data.get("authentication")
@@ -32,7 +32,7 @@ class ObsClient:
                 secret = base64.b64encode(hashlib.sha256((self.password + auth["salt"]).encode()).digest()).decode()
                 identify["authentication"] = base64.b64encode(hashlib.sha256((secret + auth["challenge"]).encode()).digest()).decode()
             await self.socket.send(json.dumps({"op": 1, "d": identify}))
-            identified = json.loads(await self.socket.recv())
+            identified = json.loads(await asyncio.wait_for(self.socket.recv(), timeout=self.request_timeout))
             if identified.get("op") != 2:
                 raise ObsConnectionError("OBS rejected WebSocket identification")
             return identified["d"]

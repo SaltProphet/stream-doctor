@@ -73,3 +73,53 @@ async def rollback_output_settings(client, output_name: str, backup: dict[str, A
     updated = dict(current_response.get("outputSettings", {}))
     updated.update(backup)
     await client.request("SetOutputSettings", {"outputName": output_name, "outputSettings": updated})
+
+
+async def inspect_stream_profile(client) -> dict[str, Any]:
+    async def parameter(category, name):
+        response = await client.request("GetProfileParameter", {
+            "parameterCategory": category, "parameterName": name,
+        })
+        return response.get("parameterValue")
+
+    profile = (await client.request("GetProfileList")).get("currentProfileName")
+    mode = await parameter("Output", "Mode")
+    config = {**await client.request("GetVideoSettings"), "profile": profile, "mode": mode}
+    if mode == "Simple":
+        bitrate = await parameter("SimpleOutput", "VBitrate")
+        config["bitrate"] = int(bitrate) if str(bitrate).isdigit() else None
+        config["encoder"] = await parameter("SimpleOutput", "StreamEncoder")
+    return config
+
+
+async def change_profile_bitrate(client, profile: str, expected: int, bitrate: int) -> dict[str, Any]:
+    config = await inspect_stream_profile(client)
+    if config["profile"] != profile or config["mode"] != "Simple" or config.get("bitrate") != expected:
+        raise ValueError("OBS profile or bitrate changed. Run Preflight again before writing.")
+    if bitrate <= 0:
+        raise ValueError("Bitrate must be positive.")
+    status = await client.request("GetStreamStatus")
+    if status.get("outputActive") is not False or status.get("outputReconnecting"):
+        raise ValueError("Stop the broadcast before changing its profile.")
+
+    async def write(value):
+        await client.request("SetProfileParameter", {
+            "parameterCategory": "SimpleOutput", "parameterName": "VBitrate", "parameterValue": str(value),
+        })
+
+    try:
+        await write(bitrate)
+        after = await inspect_stream_profile(client)
+        if after["profile"] != profile or after.get("bitrate") != bitrate:
+            raise ValueError("OBS did not verify the requested bitrate.")
+    except Exception as error:
+        current = await inspect_stream_profile(client)
+        if current["profile"] != profile:
+            raise ValueError("OBS switched profiles during the write. Check the original profile manually.") from error
+        if current.get("bitrate") != expected:
+            await write(expected)
+            restored = await inspect_stream_profile(client)
+            if restored["profile"] != profile or restored.get("bitrate") != expected:
+                raise ValueError("OBS did not verify restoration of the original bitrate.") from error
+        raise
+    return after

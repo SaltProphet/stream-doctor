@@ -47,6 +47,19 @@ class BlackoutTracker:
         self._first_black_timestamp: str | None = None
         self._open_incident_id: int | None = None
 
+    @property
+    def active(self) -> bool:
+        return self._open_incident_id is not None
+
+    def interrupt(self, timestamp: str, reason: str) -> None:
+        if self.active:
+            start = datetime.fromisoformat(self._first_black_timestamp)
+            duration = max(0.0, (datetime.fromisoformat(timestamp) - start).total_seconds())
+            self.incident_store.close_incident(self._open_incident_id, timestamp, duration, "unverified", {"end_reason": reason})
+        self._open_incident_id = None
+        self._first_black_timestamp = None
+        self._black_count = 0
+
     def observe(self, observation: VideoObservation, timestamp: str, context: dict[str, Any]) -> dict[str, Any] | None:
         if not observation.available or not context.get("stream_active"):
             return None
@@ -186,10 +199,16 @@ class LiveMonitor:
                         video_event = self.blackout_tracker.observe(video_observation, timestamp, context)
                     else:
                         video_event = None
+                        if not sample.stream_active:
+                            self.blackout_tracker.interrupt(timestamp, "broadcast inactive")
+                        elif not self.blackout_tracker.active:
+                            self.blackout_tracker.interrupt(timestamp, "video observation unavailable")
                     diagnosis = diagnose_sample(sample)
                     self.samples_collected += 1
-                    record = {"timestamp": timestamp, "sample": sample.__dict__, "diagnosis": diagnosis.__dict__, "video": video_observation.__dict__ if video_observation else None, "video_event": video_event, "obs_config": _safe_obs_config(snapshot)}
+                    record = {"timestamp": timestamp, "sample": sample.__dict__, "diagnosis": diagnosis.__dict__, "video": video_observation.__dict__ if video_observation else None, "video_event": video_event, "blackout_active": self.blackout_tracker.active, "obs_config": _safe_obs_config(snapshot)}
                     self.records.append(record)
+                    if len(self.records) > 600:
+                        del self.records[0]
                     if self.on_sample:
                         self.on_sample(record)
                     if self._has_observed_state and sample.stream_active and not self._was_active:
@@ -206,11 +225,18 @@ class LiveMonitor:
                     self._was_active = sample.stream_active
                     self._was_reconnecting = sample.reconnecting
                     self._has_observed_state = True
-                    if diagnosis.category != "healthy":
+                    if diagnosis.category not in ("healthy", "unknown"):
                         self.incident_store.record(diagnosis.category, diagnosis.explanation, {"timestamp": timestamp, "sample": sample.__dict__, "next_action": diagnosis.next_action})
                     await asyncio.sleep(self.interval)
                 except Exception as exc:
                     self.reconnections += 1
+                    self._previous_bytes = self._previous_time = None
+                    self.blackout_tracker.interrupt(datetime.now(timezone.utc).isoformat(), "OBS connection interrupted")
+                    if self.on_sample:
+                        self.on_sample({"_obs_connected": False, "diagnosis": {
+                            "category": "connection", "explanation": "OBS WebSocket connection interrupted.",
+                            "next_action": "Check OBS WebSocket and wait for reconnection.",
+                        }})
                     self.incident_store.record("obs", "OBS monitoring connection interrupted", {"error": str(exc), "reconnections": self.reconnections, "timestamp": datetime.now(timezone.utc).isoformat()})
                     try:
                         await client.close()
@@ -218,6 +244,7 @@ class LiveMonitor:
                         pass
                     await asyncio.sleep(self.interval)
         finally:
+            self.blackout_tracker.interrupt(datetime.now(timezone.utc).isoformat(), "monitoring ended")
             await client.close()
 
     def stop(self) -> None:

@@ -1,9 +1,3 @@
-"""Stream Doctor — redesigned UI (merged).
-
-Drop-in replacement for stream_doctor/app.py.
-Contains the original MonitorWorker (unchanged) plus the new sidebar UI
-and floating Live Monitor. No circular import.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -11,25 +5,26 @@ import json
 import os
 import sys
 from pathlib import Path
+from datetime import datetime
 
 from PySide6.QtCore import QThread, Qt, Signal, QTimer
-from PySide6.QtGui import QAction, QColor, QPainter, QPen
+from PySide6.QtGui import QAction, QColor, QPainter, QPen, QFont
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QPushButton, QSlider, QSpinBox, QStackedWidget,
-    QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QScrollArea, QSizeGrip, QStyle, QHeaderView, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .core import IncidentStore, RecommendationEngine
 from .monitoring import LiveMonitor
-from .measurements import build_optimizer_inputs
+from .measurements import build_optimizer_inputs, fresh_upload
 from .network import measure_cloudflare_upload, measure_network_quality, measure_upload_capacity
 from .obs import ObsClient, ObsConnectionError
-from .optimizer import apply_supported_output_settings, rollback_output_settings
+from .optimizer import change_profile_bitrate, inspect_stream_profile
 from .reports import export_report, report_format_for_path
 from .session import ConnectionSettings, MonitoringSession
-from .telemetry import hardware_snapshot, local_latency
+from .telemetry import hardware_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -47,8 +42,8 @@ class MonitorWorker(QThread):
         self.monitor: LiveMonitor | None = None
         self.session: MonitoringSession | None = None
         self.report_records: list[dict] = []
-        self.hardware_measurements = hardware_snapshot()
-        self.network_measurements = {"latency_ms": local_latency(), "jitter_ms": None, "packet_loss_percent": None, "upload_mbps": None}
+        self.hardware_measurements = {}
+        self._stop_requested = False
 
     def run(self) -> None:
         async def work() -> None:
@@ -56,6 +51,8 @@ class MonitorWorker(QThread):
             try:
                 self.state_changed.emit(f"Connecting to {self.settings.url} …")
                 await client.connect()
+                if self._stop_requested:
+                    return
                 version = await client.request("GetVersion")
                 try:
                     self.hardware_measurements["encoder_capabilities"] = (await client.discover_encoder_capabilities()).get("supported_encoders", [])
@@ -66,7 +63,8 @@ class MonitorWorker(QThread):
                 self.session.start()
                 self.state_changed.emit(f"Connected: {instance}")
                 self.monitor = LiveMonitor(lambda: client, self.store, on_sample=self._on_sample)
-                await self.monitor.run()
+                if not self._stop_requested:
+                    await self.monitor.run()
             except Exception as exc:
                 self.state_changed.emit(f"Connection/monitoring error: {exc}")
             finally:
@@ -78,9 +76,12 @@ class MonitorWorker(QThread):
 
     def _on_sample(self, record: dict) -> None:
         self.report_records.append(record)
+        if len(self.report_records) > 600:
+            del self.report_records[0]
         self.sample_received.emit(record)
 
     def stop_monitoring(self) -> None:
+        self._stop_requested = True
         if self.monitor:
             self.monitor.stop()
 
@@ -88,6 +89,22 @@ class MonitorWorker(QThread):
 # ---------------------------------------------------------------------------
 # UI components
 # ---------------------------------------------------------------------------
+class TaskWorker(QThread):
+    completed = Signal(object, str)
+
+    def __init__(self, task, parent):
+        super().__init__(parent)
+        self.task = task
+
+    def run(self):
+        try:
+            result = self.task()
+        except Exception as exc:
+            self.completed.emit(None, str(exc))
+        else:
+            self.completed.emit(result, "")
+
+
 class MiniChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -105,7 +122,7 @@ class MiniChart(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#111318"))
         if len(self.values) < 2:
-            painter.setPen(QColor("#8b9085"))
+            painter.setPen(QColor("#b6bfcc"))
             painter.drawText(self.rect(), Qt.AlignCenter, "Waiting for samples")
             return
         painter.setPen(QPen(QColor("#c2410c"), 1.5))
@@ -159,7 +176,7 @@ class FloatingMonitor(QWidget):
 
         self.warning = QLabel("")
         self.warning.setWordWrap(True)
-        self.warning.setStyleSheet("color: #c2410c;")
+        self.warning.setStyleSheet("color: #ffae79;")
         root.addWidget(self.warning)
 
         controls = QHBoxLayout()
@@ -178,16 +195,25 @@ class FloatingMonitor(QWidget):
         inc.clicked.connect(self.open_incident.emit)
         actions.addWidget(dash)
         actions.addWidget(inc)
+        self.grip = QSizeGrip(self)
+        self.grip.setAccessibleName("Resize floating monitor")
+        actions.addWidget(self.grip)
         root.addLayout(actions)
-
+        self.details = (self.dropped_label, self.opacity, controls.itemAt(0).widget(), inc, self.grip)
+        self.opacity.setAccessibleName("Floating monitor opacity")
+        self.opacity.sliderReleased.connect(self._save_geometry)
         self._apply_mode()
 
-    def _apply_mode(self) -> None:
+    def _apply_mode(self, resize=True) -> None:
         expanded = self.mode == "expanded"
         compact = self.mode == "compact"
         self.chart.setVisible(expanded)
+        for widget in self.details:
+            widget.setVisible(expanded or compact)
         self.render_label.setVisible(expanded or compact)
         self.warning.setVisible(expanded or self.emergency)
+        if not resize:
+            return
         if self.mode == "collapsed":
             self.resize(280, 48)
         elif compact:
@@ -201,16 +227,18 @@ class FloatingMonitor(QWidget):
         self._save_geometry()
 
     def set_emergency(self, active: bool, message: str = "") -> None:
+        changed = self.emergency != active
         self.emergency = active
         self.setObjectName("overlayEmergency" if active else "overlayWindow")
-        self.style().unpolish(self)
-        self.style().polish(self)
+        if changed:
+            self.style().unpolish(self)
+            self.style().polish(self)
         if active:
             self.warning.setText(message or "Emergency condition detected")
-            self.warning.setStyleSheet("color: #b91c1c; font-weight: 600;")
+            self.warning.setStyleSheet("color: #ffaaa5; font-weight: 600;")
         else:
-            self.warning.setStyleSheet("color: #c2410c;")
-        self._apply_mode()
+            self.warning.setStyleSheet("color: #ffae79;")
+        self._apply_mode(resize=False)
 
     def update_sample(self, record: dict) -> None:
         sample = record.get("sample", {})
@@ -226,6 +254,7 @@ class FloatingMonitor(QWidget):
             black = video.get("is_black")
 
         self.status_row.setText(
+            "OBS: Disconnected" if record.get("_obs_connected") is False else
             f"OBS: Connected  •  Stream: {'Streaming' if active else 'Not streaming'}"
         )
         self.bitrate_label.setText(
@@ -252,7 +281,7 @@ class FloatingMonitor(QWidget):
             emergency, msg = True, "OBS disconnected"
         elif active and isinstance(bitrate, (int, float)) and bitrate < 50:
             emergency, msg = True, "Bitrate collapsed"
-        elif black is True or (isinstance(black, (int, float)) and black >= 0.98):
+        elif record.get("blackout_active", black is True or (isinstance(black, (int, float)) and black >= 0.98)):
             emergency, msg = True, "Sustained black video detected"
         self.set_emergency(emergency, msg)
 
@@ -288,11 +317,11 @@ class FloatingMonitor(QWidget):
         try:
             data = json.loads(self._settings_path().read_text(encoding="utf-8"))
             self.move(data.get("x", 100), data.get("y", 100))
-            self.resize(data.get("w", 320), data.get("h", 180))
             self.mode = data.get("mode", "compact")
             self.opacity.setValue(data.get("opacity", 90))
-            self._apply_mode()
-        except (OSError, json.JSONDecodeError, KeyError):
+            self._apply_mode(resize=False)
+            self.resize(data.get("w", 320), data.get("h", 180))
+        except (OSError, ValueError, TypeError, KeyError):
             pass
 
 
@@ -311,11 +340,15 @@ class MainWindow(QMainWindow):
         self.worker: MonitorWorker | None = None
         self.last_record: dict = {}
         self.engine = RecommendationEngine()
-        self._hardware_measurements = hardware_snapshot()
-        self._network_measurements = {"latency_ms": local_latency(), "jitter_ms": None, "packet_loss_percent": None, "upload_mbps": None}
+        self._hardware_measurements = {}
+        self._network_measurements = {}
         self._obs_config: dict = {}
+        self._preflight_settings = None
         self._optimizer_recommendations: list[dict] = []
         self._optimizer_backup: dict | None = None
+        self._task = None
+        self._quitting = False
+        self._last_optimizer_view = None
 
         self.overlay = FloatingMonitor()
         self.overlay.open_dashboard.connect(self._show_from_overlay)
@@ -324,6 +357,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_tray()
         self._apply_theme()
+        self.monitor_button.setFocus()
 
         smoke_file = os.environ.get("STREAM_DOCTOR_SMOKE_FILE")
         if smoke_file:
@@ -332,7 +366,9 @@ class MainWindow(QMainWindow):
     def _apply_theme(self) -> None:
         qss = Path(__file__).with_name("theme.qss")
         if qss.exists():
-            self.setStyleSheet(qss.read_text(encoding="utf-8"))
+            theme = qss.read_text(encoding="utf-8")
+            self.setStyleSheet(theme)
+            self.overlay.setStyleSheet(theme)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -342,15 +378,15 @@ class MainWindow(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(180)
+        sidebar.setFixedWidth(150)
         side_layout = QVBoxLayout(sidebar)
         self.nav = QListWidget()
+        self.nav.setAccessibleName("Main navigation")
         self.nav.setObjectName("sidebarList")
         for name in ("Dashboard", "Preflight", "Diagnostics", "Optimizer", "Incidents", "Settings"):
             self.nav.addItem(QListWidgetItem(name))
         self.nav.currentRowChanged.connect(self._switch)
         side_layout.addWidget(self.nav)
-        side_layout.addStretch()
         root.addWidget(sidebar)
 
         self.stack = QStackedWidget()
@@ -363,13 +399,23 @@ class MainWindow(QMainWindow):
             "Settings": self._settings_page(),
         }
         for page in self.pages.values():
-            self.stack.addWidget(page)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(page)
+            self.stack.addWidget(scroll)
+        for table in (self.preflight_table, self.opt_table, self.inc_table):
+            table.setEditTriggers(QTableWidget.NoEditTriggers)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            table.horizontalHeader().setStretchLastSection(True)
         root.addWidget(self.stack, 1)
         self.setCentralWidget(central)
         self.nav.setCurrentRow(0)
 
     def _switch(self, row: int) -> None:
         self.stack.setCurrentIndex(row)
+        if row == 4:
+            self._refresh_incidents()
 
     def _show_screen(self, name: str) -> None:
         idx = list(self.pages.keys()).index(name)
@@ -380,40 +426,80 @@ class MainWindow(QMainWindow):
     def _dashboard_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+        heading = QLabel("Dashboard")
+        heading.setObjectName("pageTitle")
+        layout.addWidget(heading)
         strip = QFrame()
         strip.setObjectName("statusStrip")
         strip_l = QHBoxLayout(strip)
-        self.obs_status = QLabel("OBS: Unknown")
-        self.stream_status = QLabel("Stream: Unknown")
-        self.health_status = QLabel("Status: Unknown")
+        strip_l.setSpacing(20)
+        self.obs_status = QLabel("OBS: Not checked")
+        self.stream_status = QLabel("Stream: Not observed")
+        self.health_status = QLabel("Monitoring: Stopped")
         for w in (self.obs_status, self.stream_status, self.health_status):
             strip_l.addWidget(w)
         strip_l.addStretch()
         layout.addWidget(strip)
 
-        charts = QHBoxLayout()
+        controls = QHBoxLayout()
+        self.connect_button = QPushButton("Connect to OBS")
+        self.connect_button.setToolTip("Check OBS WebSocket using the endpoint in Settings.")
+        self.connect_button.clicked.connect(self._test_connection)
+        self.monitor_button = QPushButton("Start monitoring")
+        self.monitor_button.setObjectName("primary")
+        self.monitor_button.setAccessibleDescription("Starts or stops Stream Doctor telemetry only.")
+        self.monitor_button.clicked.connect(self._toggle_monitoring)
+        controls.addWidget(self.monitor_button)
+        controls.addWidget(self.connect_button)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        actions = QHBoxLayout()
+        preflight = QPushButton("Run Preflight")
+        preflight.clicked.connect(self._open_preflight)
+        optimizer = QPushButton("Open Optimizer")
+        optimizer.clicked.connect(lambda: self._show_screen("Optimizer"))
+        self.overlay_enabled = QCheckBox("Floating monitor")
+        self.overlay_enabled.toggled.connect(self._toggle_overlay)
+        for control in (preflight, optimizer, self.overlay_enabled):
+            actions.addWidget(control)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        self.dashboard_warning = QLabel("Start monitoring to see live stream health.")
+        self.dashboard_warning.setWordWrap(True)
+        self.dashboard_warning.setObjectName("dashboardWarning")
+        layout.addWidget(self.dashboard_warning)
+
         self.bitrate_chart = MiniChart()
         self.dropped_chart = MiniChart()
         self.render_chart = MiniChart()
-        for title, chart in (("Bitrate (kbps)", self.bitrate_chart),
-                             ("Dropped frames %", self.dropped_chart),
-                             ("Render lag (ms)", self.render_chart)):
-            box = QVBoxLayout()
-            box.addWidget(QLabel(title))
-            box.addWidget(chart)
-            charts.addLayout(box)
-        layout.addLayout(charts)
-
-        metrics = QFormLayout()
         self.m_bitrate = QLabel("Unavailable")
         self.m_dropped = QLabel("Unavailable")
         self.m_render = QLabel("Unavailable")
         self.m_network = QLabel("Unavailable")
-        metrics.addRow("Observed bitrate", self.m_bitrate)
-        metrics.addRow("Dropped frames", self.m_dropped)
-        metrics.addRow("Render lag", self.m_render)
-        metrics.addRow("Network loss", self.m_network)
-        layout.addLayout(metrics)
+        for metrics in (
+            (("Observed bitrate", self.m_bitrate, self.bitrate_chart),
+             ("Dropped frames", self.m_dropped, self.dropped_chart)),
+            (("Render time", self.m_render, self.render_chart),
+             ("Network loss", self.m_network, None)),
+        ):
+            row = QHBoxLayout()
+            for title, value, chart in metrics:
+                card = QFrame()
+                card.setObjectName("metricCard")
+                box = QVBoxLayout(card)
+                box.addWidget(QLabel(title))
+                value.setObjectName("metricValue")
+                box.addWidget(value)
+                if chart:
+                    box.addWidget(chart)
+                else:
+                    box.addStretch()
+                row.addWidget(card, 1)
+            layout.addLayout(row)
         layout.addStretch()
         return page
 
@@ -422,87 +508,130 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.addWidget(QLabel("<b>Preflight</b> — measured checks only"))
         self.preflight_table = QTableWidget(0, 3)
+        self.preflight_table.setAccessibleName("Preflight results")
         self.preflight_table.setHorizontalHeaderLabels(["Check", "Result", "Detail"])
         layout.addWidget(self.preflight_table)
-        run = QPushButton("Run checks")
+        run = QPushButton("Run Preflight")
         run.setObjectName("primary")
         run.clicked.connect(self._run_preflight)
         layout.addWidget(run)
-        self.preflight_summary = QLabel("Not run")
+        self.preflight_summary = QLabel("Run Preflight to inspect OBS, hardware and Internet upload.")
+        self.preflight_summary.setWordWrap(True)
         layout.addWidget(self.preflight_summary)
         target = QFormLayout()
         self.upload_host_edit = QLineEdit()
-        self.upload_host_edit.setPlaceholderText("Explicit test endpoint; never run during a live stream")
+        self.upload_host_edit.setPlaceholderText("Optional TCP test server")
         self.upload_port_edit = QSpinBox()
         self.upload_port_edit.setRange(1, 65535)
         self.upload_port_edit.setValue(443)
         target.addRow("Network test host", self.upload_host_edit)
         target.addRow("Network test port", self.upload_port_edit)
         layout.addLayout(target)
-        network_button = QPushButton("Measure upload capacity")
+        network_button = QPushButton("Test custom TCP server")
         network_button.clicked.connect(self._measure_upload_capacity)
         layout.addWidget(network_button)
-        internet_button = QPushButton("Measure Internet upload (Cloudflare)")
+        internet_button = QPushButton("Retest Internet upload")
         internet_button.clicked.connect(self._measure_cloudflare_upload)
         layout.addWidget(internet_button)
         return page
 
+    def _open_preflight(self) -> None:
+        self._show_screen("Preflight")
+        self._run_preflight()
+
     def _run_preflight(self) -> None:
-        rows = []
-        quality = measure_network_quality("8.8.8.8", 443, samples=3)
-        lat = quality.latency_ms
-        self._network_measurements.update({"latency_ms": lat, "jitter_ms": quality.jitter_ms, "packet_loss_percent": quality.packet_loss_percent, "measured_at": quality.measured_at})
-        rows.append(("Internet latency", "Healthy" if lat and lat < 100 else "Unstable" if lat else "Unavailable",
-                      f"{lat:.0f} ms" if lat else "Unavailable"))
-        hw = hardware_snapshot()
-        rows.append(("Hardware snapshot", "Healthy", f"{hw.get('logical_cpus')} CPUs, {hw.get('ram_gb')} GB RAM"))
-        gpus = hw.get("gpus") or []
-        rows.append(("GPU discovery", "Healthy" if gpus else "Unavailable", ", ".join(gpus) if gpus else "Unavailable"))
-        rows.append(("Hardware encoder capability", "Unavailable", "OBS encoder compatibility requires an encoder-specific probe"))
-        rows.append(("Network jitter", "Healthy" if quality.jitter_ms is not None else "Unavailable", f"{quality.jitter_ms:.3f} ms" if quality.jitter_ms is not None else "Unavailable"))
-        rows.append(("Packet loss", "Healthy" if quality.packet_loss_percent is not None and quality.packet_loss_percent == 0 else "Unstable" if quality.packet_loss_percent is not None else "Unavailable", f"{quality.packet_loss_percent:.1f}%" if quality.packet_loss_percent is not None else "Unavailable"))
-        rows.append(("Sustained upload capacity", "Unavailable", "Required before bitrate recommendations"))
-        rows.append(("OBS WebSocket", "Unknown", "Use Settings → Test connection"))
-        self.preflight_table.setRowCount(len(rows))
-        for i, (name, status, detail) in enumerate(rows):
-            self.preflight_table.setItem(i, 0, QTableWidgetItem(name))
-            self.preflight_table.setItem(i, 1, QTableWidgetItem(status))
-            self.preflight_table.setItem(i, 2, QTableWidgetItem(detail))
-        bad = any(s in ("Unstable", "Critical", "Unavailable") for _, s, _ in rows)
-        self.preflight_summary.setText("Issues found — review before streaming" if bad else "Ready (limited checks)")
+        self._start_preflight()
+
+    def _measure_cloudflare_upload(self) -> None:
+        self._start_preflight()
 
     def _measure_upload_capacity(self) -> None:
         if self.last_record.get("sample", {}).get("stream_active"):
-            self.preflight_summary.setText("Unavailable: upload measurement is disabled while streaming")
+            self.preflight_summary.setText("Upload measurement is disabled while streaming.")
             return
         host = self.upload_host_edit.text().strip()
         if not host:
-            self.preflight_summary.setText("Unavailable: enter an explicit upload test endpoint")
+            self.preflight_summary.setText("Enter a TCP test server that accepts and discards test data.")
             return
-        port = self.upload_port_edit.value()
-        quality = measure_network_quality(host, port, samples=5)
-        try:
-            upload = measure_upload_capacity(host, port, stream_active=False)
-        except (OSError, RuntimeError, ValueError) as exc:
-            self.preflight_summary.setText(f"Upload measurement failed: {exc}")
-            return
-        self._network_measurements.update({"latency_ms": quality.latency_ms, "jitter_ms": quality.jitter_ms, "packet_loss_percent": quality.packet_loss_percent, "upload_mbps": upload.upload_mbps, "measured_at": upload.measured_at})
-        self.preflight_summary.setText(f"Upload measured: {upload.upload_mbps:.2f} Mbps" if upload.upload_mbps is not None else "Upload measurement unavailable")
+        self._start_preflight((host, self.upload_port_edit.value()))
 
-    def _measure_cloudflare_upload(self) -> None:
-        if self.last_record.get("sample", {}).get("stream_active"):
-            self.preflight_summary.setText("Unavailable: upload measurement is disabled while streaming")
-            return
-        try:
-            result = measure_cloudflare_upload(stream_active=False)
-        except (OSError, RuntimeError, ValueError) as exc:
-            self.preflight_summary.setText(f"Internet upload measurement failed: {exc}")
-            return
-        self._network_measurements.update({"upload_mbps": result.upload_mbps, "measured_at": result.measured_at, "upload_bytes": result.bytes_transferred, "upload_samples": result.samples, "upload_endpoint": result.endpoint})
-        if result.upload_mbps is None:
-            self.preflight_summary.setText(f"Internet upload unavailable: {result.error or 'no samples completed'}")
+    def _start_preflight(self, custom_endpoint=None) -> None:
+        settings = self._current_settings()
+
+        async def check_obs():
+            client = ObsClient(settings.url, settings.password)
+            try:
+                await client.connect()
+                config = await inspect_stream_profile(client)
+                inputs = (await client.request("GetInputList")).get("inputs", [])
+                cameras = [item["inputName"] for item in inputs
+                           if item.get("inputKind") in {"dshow_input", "v4l2_input", "av_capture_input"}]
+                status = await client.request("GetStreamStatus")
+                return config, cameras, status.get("outputActive") is False and not status.get("outputReconnecting")
+            finally:
+                await client.close()
+
+        async def preflight():
+            hardware = hardware_snapshot()
+            quality = measure_network_quality("8.8.8.8", 443, samples=5)
+            try:
+                config, cameras, idle = await check_obs()
+            except Exception as exc:
+                return hardware, quality, {}, [], None, f"OBS unavailable: {exc}"
+            if not idle:
+                return hardware, quality, config, cameras, None, "Upload measurement is disabled while streaming."
+            if custom_endpoint:
+                result = await asyncio.to_thread(measure_upload_capacity, *custom_endpoint)
+                detail = f"Custom TCP throughput: {result.upload_mbps:g} Mbps. Run the Internet test for optimization." if result.upload_mbps is not None else "Custom TCP upload unavailable."
+                return hardware, quality, config, cameras, None, detail
+            result = await asyncio.to_thread(measure_cloudflare_upload)
+            detail = result.error or "No upload samples completed" if result.upload_mbps is None else ""
+            return hardware, quality, config, cameras, result, detail
+
+        if self._run_task(lambda: asyncio.run(preflight()),
+                          lambda result, error: self._preflight_finished(result, error, settings)):
+            self.preflight_summary.setText("Checking OBS, hardware and network…")
         else:
-            self.preflight_summary.setText(f"Internet upload: {result.upload_mbps:.2f} Mbps ({result.bytes_transferred} bytes, {result.samples} samples)")
+            self.preflight_summary.setText("Wait for the current check to finish.")
+
+    def _preflight_finished(self, result, error, settings) -> None:
+        if error:
+            self.preflight_summary.setText(f"Preflight failed: {error}")
+            return
+        hardware, quality, config, cameras, upload, detail = result
+        self._hardware_measurements.update(hardware)
+        self._obs_config = config
+        self._preflight_settings = settings
+        self._network_measurements.update({
+            "latency_ms": quality.latency_ms, "jitter_ms": quality.jitter_ms,
+            "tcp_failure_percent": quality.packet_loss_percent,
+        })
+        if upload is not None:
+            self._network_measurements.update({"upload_mbps": upload.upload_mbps, "upload_measured_at": upload.measured_at})
+        self.preflight_summary.setText(
+            detail or f"Internet upload: {upload.upload_mbps:.2f} Mbps across {upload.samples} samples ({upload.bytes_transferred:,} bytes)."
+        )
+        rows = [
+            ("OBS profile", config.get("profile"), config.get("mode")),
+            ("Video output", f"{config['outputWidth']} × {config['outputHeight']}" if config.get("outputWidth") else None,
+             f"{config['fpsNumerator'] / config['fpsDenominator']:g} FPS" if config.get("fpsDenominator") else None),
+            ("Configured bitrate", config.get("bitrate"), "kbps"),
+            ("Configured encoder", config.get("encoder"), "Encoder availability list unavailable via this probe"),
+            ("Capture sources", ", ".join(cameras), "Configured in OBS"),
+            ("CPU", hardware.get("cpu"), f"{hardware.get('logical_cpus')} logical cores, {hardware.get('cpu_percent')}% load"),
+            ("Memory", f"{hardware.get('ram_gb')} GB", f"{hardware.get('ram_percent')}% used"),
+            ("GPU", ", ".join(hardware.get("gpus", [])), "GPU utilization unavailable"),
+            ("TCP connect latency", quality.latency_ms, "ms to 8.8.8.8"),
+            ("TCP connect jitter", quality.jitter_ms, "ms"),
+            ("TCP connection failures", quality.packet_loss_percent, "% of attempts"),
+            ("Internet upload", upload.upload_mbps if upload else None, "Mbps via Cloudflare"),
+        ]
+        self.preflight_table.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            for column, value in enumerate(row):
+                self.preflight_table.setItem(i, column, QTableWidgetItem(str(value) if value is not None and value != "" else "Unavailable"))
+        self.preflight_table.resizeRowsToContents()
+        self._refresh_optimizer()
 
     def _diagnostics_page(self) -> QWidget:
         page = QWidget()
@@ -519,12 +648,19 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.addWidget(QLabel("<b>Optimizer</b> — recommendations only from measured conditions"))
         self.opt_table = QTableWidget(0, 4)
+        self.opt_table.setAccessibleName("OBS recommendations")
+        self.opt_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.opt_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.opt_table.itemSelectionChanged.connect(self._update_optimizer_buttons)
         self.opt_table.setHorizontalHeaderLabels(["Setting", "Current", "Recommended", "Reason"])
         layout.addWidget(self.opt_table)
         self.opt_status = QLabel("Waiting for measured OBS and network data")
         self.opt_status.setWordWrap(True)
+        self.opt_context = QLabel("Run Preflight to read the current OBS profile.")
+        self.opt_context.setWordWrap(True)
+        layout.addWidget(self.opt_context)
         layout.addWidget(self.opt_status)
-        note = QLabel("No automatic changes. Backup and rollback are required before any write.")
+        note = QLabel("Bitrate changes apply to Simple Output profiles before the next broadcast. Other recommendations are manual.")
         note.setWordWrap(True)
         layout.addWidget(note)
         self.opt_apply = QPushButton("Apply selected recommendation")
@@ -542,8 +678,9 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.addWidget(QLabel("<b>Incidents</b> — local SQLite history (session events are distinct from broadcast events)"))
-        self.inc_table = QTableWidget(0, 5)
-        self.inc_table.setHorizontalHeaderLabels(["Time", "Category", "Summary", "Duration", "Evidence"])
+        self.inc_table = QTableWidget(0, 6)
+        self.inc_table.setAccessibleName("Incident timeline")
+        self.inc_table.setHorizontalHeaderLabels(["Local time", "Category", "Summary", "Duration", "Recovery", "Evidence"])
         layout.addWidget(self.inc_table)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self._refresh_incidents)
@@ -558,13 +695,21 @@ class MainWindow(QMainWindow):
         rows = self.store.search()
         self.inc_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
-            self.inc_table.setItem(i, 0, QTableWidgetItem(row.get("timestamp", "")[:19]))
+            raw = row.get("timestamp", "")
+            try:
+                stamp = datetime.fromisoformat(raw).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                stamp = raw
+            self.inc_table.setItem(i, 0, QTableWidgetItem(stamp))
             self.inc_table.setItem(i, 1, QTableWidgetItem(row.get("category", "")))
             self.inc_table.setItem(i, 2, QTableWidgetItem(row.get("summary", "")))
             ev = row.get("evidence", {})
             dur = row.get("duration_seconds")
-            self.inc_table.setItem(i, 3, QTableWidgetItem(f"{dur:.0f}s" if isinstance(dur, (int, float)) else "—"))
-            self.inc_table.setItem(i, 4, QTableWidgetItem(str(ev)[:80]))
+            self.inc_table.setItem(i, 3, QTableWidgetItem(f"{dur:.3f} s" if isinstance(dur, (int, float)) else "—"))
+            self.inc_table.setItem(i, 4, QTableWidgetItem(row.get("recovery_status") or "Unavailable"))
+            evidence = QTableWidgetItem(str(ev)[:80])
+            evidence.setToolTip(json.dumps(ev, indent=2))
+            self.inc_table.setItem(i, 5, evidence)
 
     def _export_report(self) -> None:
         report = {
@@ -590,67 +735,52 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Report exported", f"The sanitized report was saved to:\n{path}")
 
     def _apply_optimizer_recommendation(self) -> None:
-        if not self._optimizer_recommendations:
-            return
-        if self.last_record.get("sample", {}).get("stream_active"):
-            QMessageBox.warning(self, "Apply blocked", "OBS reports an active stream. Stop the stream manually before applying a setting.")
-            return
-        output_name = self._obs_config.get("outputName")
-        if not output_name:
-            QMessageBox.warning(self, "Apply unavailable", "The active OBS output name is unavailable.")
-            return
         row = self.opt_table.currentRow()
-        recommendation = self._optimizer_recommendations[row if row >= 0 else 0]
-        setting = {"bitrate_kbps": "bitrate"}.get(recommendation.get("setting"), recommendation.get("setting"))
-        if setting != "bitrate":
-            QMessageBox.warning(self, "Apply unavailable", "Only verified OBS bitrate changes are currently supported by the UI.")
+        if not 0 <= row < len(self._optimizer_recommendations):
             return
-        if QMessageBox.question(self, "Apply recommendation", "Apply this measured recommendation to OBS?") != QMessageBox.StandardButton.Yes:
+        recommendation = self._optimizer_recommendations[row]
+        config = self._obs_config
+        if recommendation["setting"] != "bitrate_kbps" or config.get("mode") != "Simple":
             return
-        settings = self._current_settings()
-
-        async def apply():
-            client = ObsClient(settings.url, settings.password)
-            try:
-                await client.connect()
-                return await apply_supported_output_settings(client, output_name, {setting: int(recommendation["recommended"])})
-            finally:
-                await client.close()
-
-        try:
-            result = asyncio.run(apply())
-        except Exception as exc:
-            QMessageBox.critical(self, "Apply failed", str(exc))
+        if self._optimizer_backup:
             return
-        if result.get("verified"):
-            self._optimizer_backup = {"output_name": output_name, "settings": result["backup"]}
-            self.opt_rollback.setEnabled(True)
-            self.opt_status.setText("Recommendation applied and verified by OBS read-back.")
-        else:
-            self.opt_status.setText("OBS read-back did not verify the recommendation; rollback was attempted.")
+        if self._current_settings() != self._preflight_settings:
+            self.opt_status.setText("OBS endpoint changed. Run Preflight again.")
+            return
+        if fresh_upload(self._network_measurements) is None:
+            self._refresh_optimizer()
+            return
+        target = int(recommendation["recommended"])
+        current = int(recommendation["current"])
+        if QMessageBox.question(self, "Apply bitrate", f"Change OBS profile {config['profile']} from {current} to {target} kbps for the next broadcast?") != QMessageBox.StandardButton.Yes:
+            return
+        self._write_bitrate(self._current_settings(), config["profile"], current, target, rollback=False)
 
     def _rollback_optimizer_change(self) -> None:
-        if not self._optimizer_backup:
-            return
-        backup = self._optimizer_backup
-        settings = self._current_settings()
+        if self._optimizer_backup:
+            settings, profile, original, applied = self._optimizer_backup
+            self._write_bitrate(settings, profile, applied, original, rollback=True)
 
-        async def rollback():
+    def _write_bitrate(self, settings, profile, current, target, *, rollback):
+        async def write():
             client = ObsClient(settings.url, settings.password)
             try:
                 await client.connect()
-                await rollback_output_settings(client, backup["output_name"], backup["settings"])
+                return await change_profile_bitrate(client, profile, current, target)
             finally:
                 await client.close()
 
-        try:
-            asyncio.run(rollback())
-        except Exception as exc:
-            QMessageBox.critical(self, "Rollback failed", str(exc))
-            return
-        self._optimizer_backup = None
-        self.opt_rollback.setEnabled(False)
-        self.opt_status.setText("Previous OBS output setting restored.")
+        def completed(config, error):
+            if error:
+                self.opt_status.setText(f"OBS setting change failed: {error}")
+                return
+            self._obs_config = config
+            self._optimizer_backup = None if rollback else (settings, profile, current, target)
+            self._refresh_optimizer()
+            self.opt_status.setText(f"OBS verified {'restoration to' if rollback else 'the new setting of'} {target} kbps.")
+
+        if self._run_task(lambda: asyncio.run(write()), completed):
+            self.opt_status.setText("Waiting for OBS read-back…")
 
     def _settings_page(self) -> QWidget:
         page = QWidget()
@@ -680,11 +810,6 @@ class MainWindow(QMainWindow):
         self.connection_status = QLabel("Not tested")
         layout.addWidget(self.connection_status)
 
-        self.overlay_enabled = QCheckBox("Show floating Live Monitor")
-        self.overlay_enabled.setChecked(True)
-        self.overlay_enabled.toggled.connect(self._toggle_overlay)
-        layout.addWidget(self.overlay_enabled)
-
         mode_box = QHBoxLayout()
         for m in ("collapsed", "compact", "expanded"):
             b = QPushButton(m.capitalize())
@@ -692,13 +817,6 @@ class MainWindow(QMainWindow):
             mode_box.addWidget(b)
         layout.addLayout(mode_box)
 
-        start = QPushButton("Start monitoring")
-        start.setObjectName("primary")
-        start.clicked.connect(self._start_monitoring)
-        stop = QPushButton("Stop monitoring")
-        stop.clicked.connect(self._stop_monitoring)
-        layout.addWidget(start)
-        layout.addWidget(stop)
         layout.addStretch()
         return page
 
@@ -715,8 +833,25 @@ class MainWindow(QMainWindow):
         self.settings.save(self.settings_path)
         self.connection_status.setText(f"Saved {self.settings.url} (password not written)")
 
+    def _run_task(self, task, callback) -> bool:
+        if self._task is not None:
+            return False
+        worker = TaskWorker(task, self)
+        self._task = worker
+        worker.completed.connect(callback)
+        worker.finished.connect(self._task_finished)
+        worker.start()
+        return True
+
+    def _task_finished(self) -> None:
+        self._task.deleteLater()
+        self._task = None
+        self.connect_button.setEnabled(True)
+        self._finish_quit_if_ready()
+
     def _test_connection(self) -> None:
         settings = self._current_settings()
+
         async def probe():
             client = ObsClient(settings.url, settings.password)
             try:
@@ -724,37 +859,63 @@ class MainWindow(QMainWindow):
                 return await client.request("GetVersion")
             finally:
                 await client.close()
-        try:
-            version = asyncio.run(probe())
-            self.connection_status.setText(
-                f"Connected: OBS {version.get('obsVersion')} / WS {version.get('obsWebSocketVersion')}"
-            )
-        except ObsConnectionError as exc:
-            self.connection_status.setText(f"Unavailable: {exc}")
+
+        def completed(version, error):
+            self._on_state(f"Unavailable: {error}" if error else
+                           f"Connected: OBS {version.get('obsVersion')} / WS {version.get('obsWebSocketVersion')}")
+
+        if self._run_task(lambda: asyncio.run(probe()), completed):
+            self.connect_button.setEnabled(False)
+            self.obs_status.setText("OBS: Connecting…")
+
+    def _toggle_monitoring(self) -> None:
+        if self.worker is None:
+            self._start_monitoring()
+        else:
+            self._stop_monitoring()
 
     def _start_monitoring(self) -> None:
-        if self.worker and self.worker.isRunning():
+        if self.worker is not None:
             return
         self.settings = self._current_settings()
         self.worker = MonitorWorker(self.settings, self.store)
         self.worker.state_changed.connect(self._on_state)
         self.worker.sample_received.connect(self._on_sample)
+        self.worker.finished.connect(self._monitor_finished)
+        self.health_status.setText("Monitoring: Starting…")
+        self.monitor_button.setText("Stop monitoring")
         self.worker.start()
         if self.overlay_enabled.isChecked():
             self.overlay.show()
 
     def _stop_monitoring(self) -> None:
-        if self.worker:
+        if self.worker is not None:
             self.worker.stop_monitoring()
-            self.worker.wait(15000)
-        self.obs_status.setText("OBS: Unknown")
-        self.stream_status.setText("Stream: Not streaming")
+            self.monitor_button.setEnabled(False)
+            self.monitor_button.setText("Stopping monitoring…")
+
+    def _monitor_finished(self) -> None:
+        self.worker.deleteLater()
+        self.worker = None
+        self.last_record = {}
+        self.monitor_button.setText("Start monitoring")
+        self.monitor_button.setEnabled(True)
+        self.health_status.setText("Monitoring: Stopped")
+        self.stream_status.setText("Stream: Not observed")
+        for metric in (self.m_bitrate, self.m_dropped, self.m_render, self.m_network):
+            metric.setText("Unavailable")
+        self.dashboard_warning.setText("Start monitoring to see live stream health.")
+        self.overlay.update_sample({})
+        self.overlay.status_row.setText("Monitoring stopped")
+        self.overlay.set_emergency(False)
+        self._refresh_incidents()
+        self._finish_quit_if_ready()
 
     def _on_state(self, text: str) -> None:
         self.connection_status.setText(text)
-        if "Connected" in text:
+        if text.startswith("Connected"):
             self.obs_status.setText("OBS: Connected")
-            self.obs_status.setObjectName("statusHealthy")
+            self.connect_button.setText("Reconnect to OBS")
         elif "error" in text.lower() or "Unavailable" in text:
             self.obs_status.setText("OBS: Unavailable")
             self.obs_status.setObjectName("statusCritical")
@@ -762,22 +923,23 @@ class MainWindow(QMainWindow):
     def _on_sample(self, record: dict) -> None:
         self.last_record = record
         if self.worker:
-            self._hardware_measurements = self.worker.hardware_measurements
-            self._network_measurements = self.worker.network_measurements
+            self._hardware_measurements.update(self.worker.hardware_measurements)
         sample = record.get("sample", {})
         diagnosis = record.get("diagnosis", {})
         active = bool(sample.get("stream_active"))
         self.stream_status.setText("Stream: Streaming" if active else "Stream: Not streaming")
         cat = diagnosis.get("category", "unknown")
-        if cat == "healthy":
-            self.health_status.setText("Status: Healthy")
-            self.health_status.setObjectName("statusHealthy")
-        elif cat in ("encoder", "rendering", "network"):
-            self.health_status.setText(f"Status: Unstable ({cat})")
-            self.health_status.setObjectName("statusUnstable")
+        if record.get("_obs_connected") is False:
+            self._on_state("Unavailable: OBS disconnected. Reconnecting…")
+            self.stream_status.setText("Stream: Not observed")
         else:
-            self.health_status.setText("Status: Unknown")
-            self.health_status.setObjectName("statusUnknown")
+            self.obs_status.setText("OBS: Connected")
+        if record.get("blackout_active") or (record.get("video_event") or {}).get("summary") == "Black video detected":
+            self.health_status.setText("Health: Black video")
+            self.dashboard_warning.setText("OBS program video is black. Check the active scene and capture source.")
+        else:
+            self.dashboard_warning.setText(diagnosis.get("next_action") or "Waiting for live telemetry.")
+            self.health_status.setText(f"Health: {cat.capitalize()}" if active else "Monitoring: Active")
 
         bitrate = sample.get("bitrate_kbps")
         self.m_bitrate.setText(f"{bitrate:.1f} kbps" if isinstance(bitrate, (int, float)) else "Unavailable")
@@ -805,32 +967,69 @@ class MainWindow(QMainWindow):
             f"Evidence: bitrate={bitrate}, dropped={dropped}/{total}, render_lag={render}"
         )
 
-        self._obs_config = record.get("obs_config") or self._obs_config
+        live_config = record.get("obs_config") or {}
+        for key in ("fpsNumerator", "fpsDenominator", "outputWidth", "outputHeight"):
+            if key in live_config:
+                self._obs_config[key] = live_config[key]
+        self._refresh_optimizer(sample)
+        self.overlay.update_sample(record)
+        if record.get("video_event") and self.nav.currentRow() == 4:
+            self._refresh_incidents()
+
+    def _refresh_optimizer(self, sample=None) -> None:
+        sample = sample if sample is not None else self.last_record.get("sample", {})
         measurements = build_optimizer_inputs(
             sample=sample,
             obs_config=self._obs_config,
             hardware=self._hardware_measurements,
             network=self._network_measurements,
-            incidents=self.store.search("blackout"),
+            incidents=[],
+        )
+        obs = measurements["obs"]
+        profile = self._obs_config.get("profile") or "Unavailable"
+        bitrate = f"{obs['bitrate_kbps']} kbps" if obs["bitrate_kbps"] else "Unavailable"
+        fps = f"{obs['fps']:g} FPS" if obs["fps"] else "Unavailable FPS"
+        upload = measurements["network"]["upload_mbps"]
+        upload_text = f"{upload:.2f} Mbps" if upload else "Unavailable"
+        self.opt_context.setText(
+            f"Profile: {profile}  •  Bitrate: {bitrate}  •  Internet upload: {upload_text}\n"
+            f"{obs['resolution'] or 'Unavailable resolution'}  •  {fps}  •  Encoder: {obs['encoder'] or 'Unavailable'}"
         )
         recs = self.engine.recommend(**measurements)
         self._optimizer_recommendations = recs
-        self.opt_apply.setEnabled(bool(recs) and bool(self._obs_config.get("outputName")) and not active)
+        self._update_optimizer_buttons()
+        view = (recs, measurements["network"].get("upload_mbps"), self._obs_config.get("mode"))
+        if view == self._last_optimizer_view:
+            return
+        self._last_optimizer_view = view
         self.opt_table.setRowCount(len(recs))
         for i, r in enumerate(recs):
             self.opt_table.setItem(i, 0, QTableWidgetItem(str(r.get("setting"))))
             self.opt_table.setItem(i, 1, QTableWidgetItem(str(r.get("current"))))
             self.opt_table.setItem(i, 2, QTableWidgetItem(str(r.get("recommended"))))
             self.opt_table.setItem(i, 3, QTableWidgetItem(str(r.get("reason"))))
+        if recs:
+            self.opt_table.selectRow(0)
+        self._update_optimizer_buttons()
+        self.opt_table.resizeRowsToContents()
         if measurements["network"].get("upload_mbps") is None:
-            self.opt_status.setText("Unavailable: sustained upload capacity is required before bitrate recommendations can be generated.")
+            self.opt_status.setText("Unavailable or stale upload measurement. Run Preflight with OBS idle to get a current Internet upload measurement.")
+        elif not obs["bitrate_kbps"]:
+            self.opt_status.setText("Configured bitrate unavailable. This release reads the bitrate of Simple Output profiles.")
         elif recs:
             self.opt_status.setText(f"{len(recs)} measured recommendation(s) available; no changes are applied automatically.")
         else:
             self.opt_status.setText("No changes recommended from the current measured conditions.")
 
-        self.overlay.update_sample(record)
-        self._refresh_incidents()
+    def _update_optimizer_buttons(self) -> None:
+        row = self.opt_table.currentRow()
+        active = self.last_record.get("sample", {}).get("stream_active")
+        apply = (not active and self._optimizer_backup is None and
+                 self._obs_config.get("mode") == "Simple" and bool(self._obs_config.get("profile")) and
+                 0 <= row < len(self._optimizer_recommendations) and
+                 self._optimizer_recommendations[row]["setting"] == "bitrate_kbps")
+        self.opt_apply.setEnabled(apply)
+        self.opt_rollback.setEnabled(not active and self._optimizer_backup is not None)
 
     def _toggle_overlay(self, on: bool) -> None:
         self.overlay.setVisible(on)
@@ -842,26 +1041,43 @@ class MainWindow(QMainWindow):
 
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
         self.tray.setToolTip("Stream Doctor")
         menu = QMenu()
         show = QAction("Open Stream Doctor", self)
         show.triggered.connect(self.showNormal)
         menu.addAction(show)
         overlay = QAction("Show / hide Live Monitor", self)
-        overlay.triggered.connect(lambda: self.overlay.setVisible(not self.overlay.isVisible()))
+        overlay.triggered.connect(lambda: self.overlay_enabled.toggle())
         menu.addAction(overlay)
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self._quit)
         menu.addAction(quit_action)
+        passthrough = QAction("Floating monitor click-through", self, checkable=True)
+        passthrough.toggled.connect(self._set_overlay_passthrough)
+        menu.insertAction(quit_action, passthrough)
         self.tray.setContextMenu(menu)
         self.tray.show()
 
+    def _set_overlay_passthrough(self, enabled: bool) -> None:
+        self.overlay.setWindowFlag(Qt.WindowTransparentForInput, enabled)
+        self.overlay.setVisible(self.overlay_enabled.isChecked())
+
     def _quit(self) -> None:
+        self._quitting = True
         self._stop_monitoring()
-        QApplication.quit()
+        self._finish_quit_if_ready()
+
+    def _finish_quit_if_ready(self) -> None:
+        if self._quitting and self.worker is None and self._task is None:
+            self.overlay._save_geometry()
+            QApplication.quit()
 
     def closeEvent(self, event):  # type: ignore[no-untyped-def]
         event.ignore()
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._quit()
+            return
         self.hide()
         self.tray.showMessage("Stream Doctor", "Still running in the system tray. Live Monitor remains available.")
 
@@ -873,6 +1089,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setFont(QFont("Segoe UI" if sys.platform == "win32" else "Sans Serif", 11))
     app.setQuitOnLastWindowClosed(False)
     window = MainWindow()
     window.show()

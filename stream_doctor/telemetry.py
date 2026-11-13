@@ -9,7 +9,7 @@ import psutil
 
 
 def hardware_snapshot() -> dict[str, Any]:
-    return {"system": platform.platform(), "cpu": platform.processor() or "Unknown", "logical_cpus": psutil.cpu_count(), "ram_gb": round(psutil.virtual_memory().total / 1024**3, 1), "gpus": _gpu_names(), "network_adapters": list(psutil.net_if_addrs())}
+    return {"system": platform.platform(), "cpu": platform.processor() or "Unknown", "logical_cpus": psutil.cpu_count(), "ram_gb": round(psutil.virtual_memory().total / 1024**3, 1), "cpu_percent": psutil.cpu_percent(interval=0.2), "ram_percent": psutil.virtual_memory().percent, "gpus": _gpu_names(), "network_adapters": list(psutil.net_if_addrs())}
 
 
 def _gpu_names() -> list[str]:

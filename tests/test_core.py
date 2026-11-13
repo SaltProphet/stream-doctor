@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+import pytest
 from stream_doctor.core import (
     DiagnosticResult,
     IncidentStore,
@@ -97,3 +98,39 @@ def test_optimizer_applies_supported_output_setting_and_verifies_readback():
     assert client.settings["bitrate"] == 2500
     asyncio.run(rollback_output_settings(client, "streaming", result["backup"]))
     assert client.settings["bitrate"] == 3500
+
+
+@pytest.mark.asyncio
+async def test_simple_profile_bitrate_apply_readback_rollback():
+    from stream_doctor.optimizer import change_profile_bitrate
+
+    class Obs:
+        bitrate = "6000"
+        active = False
+
+        async def request(self, name, data=None):
+            if name == "GetProfileList":
+                return {"currentProfileName": "Disposable"}
+            if name == "GetVideoSettings":
+                return {"outputWidth": 1280, "outputHeight": 720}
+            if name == "GetStreamStatus":
+                return {"outputActive": self.active}
+            if name == "GetProfileParameter":
+                values = {"Mode": "Simple", "VBitrate": self.bitrate, "StreamEncoder": "x264"}
+                return {"parameterValue": values[data["parameterName"]]}
+            assert name == "SetProfileParameter"
+            assert data["parameterCategory"] == "SimpleOutput"
+            assert data["parameterName"] == "VBitrate"
+            self.bitrate = data["parameterValue"]
+            return {}
+
+    obs = Obs()
+    with pytest.raises(ValueError, match="profile or bitrate changed"):
+        await change_profile_bitrate(obs, "Other", 6000, 3500)
+    obs.active = True
+    with pytest.raises(ValueError, match="Stop the broadcast"):
+        await change_profile_bitrate(obs, "Disposable", 6000, 3500)
+    assert obs.bitrate == "6000"
+    obs.active = False
+    assert (await change_profile_bitrate(obs, "Disposable", 6000, 3500))["bitrate"] == 3500
+    assert (await change_profile_bitrate(obs, "Disposable", 3500, 6000))["bitrate"] == 6000

@@ -1,0 +1,63 @@
+name: Windows release build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/stream-doctor-functional-release
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install ".[test]" pyinstaller
+      - name: Run regression tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest
+      - name: Build executable and installer
+        shell: pwsh
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $compiler)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed." }
+          }
+          .\build_windows.ps1 -InnoCompiler $compiler
+      - name: Verify silent installation, packaged startup and uninstall
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem .\installer-output\StreamDoctor-Setup-*.exe | Select-Object -First 1).FullName
+          $target = Join-Path $env:RUNNER_TEMP StreamDoctor-install
+          $probe = Join-Path $env:RUNNER_TEMP stream-doctor-smoke.json
+          $install = Start-Process $setup -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=`"$target`"") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installation failed." }
+          $env:STREAM_DOCTOR_SMOKE_FILE = $probe
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $app = Start-Process (Join-Path $target StreamDoctor.exe) -PassThru
+          try {
+            for ($i = 0; $i -lt 30 -and -not (Test-Path $probe); $i++) {
+              Start-Sleep -Seconds 1
+              if ($app.HasExited) { throw "Installed application exited during launch." }
+            }
+            if (-not (Test-Path $probe)) { throw "Installed application did not initialize." }
+            $state = Get-Content $probe | ConvertFrom-Json
+            if (-not $state.sidebar -or $state.window_title -ne "Stream Doctor") { throw "Unexpected packaged startup result." }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id }
+          }
+          $uninstall = Start-Process (Join-Path $target unins000.exe) -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0 -or (Test-Path (Join-Path $target StreamDoctor.exe))) { throw "Uninstall failed." }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StreamDoctor-Windows
+          path: |
+            dist/StreamDoctor/
+            installer-output/StreamDoctor-Setup-*.exe
+          if-no-files-found: error

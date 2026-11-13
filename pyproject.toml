@@ -26,3 +26,6 @@ addopts = "-q"
 
 [tool.setuptools.packages.find]
 include = ["stream_doctor*"]
+
+[tool.setuptools.package-data]
+stream_doctor = ["theme.qss"]

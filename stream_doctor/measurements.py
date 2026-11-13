@@ -3,6 +3,18 @@
 from __future__ import annotations
 
 from typing import Any
+from datetime import datetime, timezone
+
+
+def fresh_upload(network: dict[str, Any]) -> float | None:
+    measured_at = network.get("upload_measured_at")
+    if not measured_at:
+        return None
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(measured_at)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    return network.get("upload_mbps") if 0 <= age < 900 else None
 
 
 def build_optimizer_inputs(
@@ -25,7 +37,7 @@ def build_optimizer_inputs(
 
     return {
         "obs": {
-            "bitrate_kbps": sample.get("bitrate_kbps"),
+            "bitrate_kbps": obs_config.get("bitrate"),
             "fps": fps,
             "resolution": resolution,
             "encoder": obs_config.get("encoder") or obs_config.get("outputEncoder"),
@@ -41,7 +53,7 @@ def build_optimizer_inputs(
             "latency_ms": network.get("latency_ms"),
             "jitter_ms": network.get("jitter_ms"),
             "packet_loss_percent": network.get("packet_loss_percent"),
-            "upload_mbps": network.get("upload_mbps"),
+            "upload_mbps": fresh_upload(network),
         },
         "incidents": incidents,
     }

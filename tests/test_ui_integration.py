@@ -122,3 +122,65 @@ def test_upload_measurement_is_blocked_during_active_stream():
     assert "disabled while streaming" in window.preflight_summary.text()
     window.overlay.close()
     window.close()
+
+
+def test_dashboard_start_and_stop_follow_monitor_worker(monkeypatch):
+    from PySide6.QtCore import QObject, Signal
+
+    class Worker(QObject):
+        state_changed = Signal(str)
+        sample_received = Signal(dict)
+        finished = Signal()
+
+        def __init__(self, settings, store):
+            super().__init__()
+            self.hardware_measurements = {}
+
+        def start(self):
+            self.state_changed.emit("Connected: test OBS")
+
+        def stop_monitoring(self):
+            self.stopping = True
+
+    _app()
+    monkeypatch.setattr("stream_doctor.app.MonitorWorker", Worker)
+    window = MainWindow()
+    window.monitor_button.click()
+    worker = window.worker
+    assert window.monitor_button.text() == "Stop monitoring"
+    assert "Connected" in window.obs_status.text()
+    worker.sample_received.emit({
+        "sample": {"stream_active": True, "bitrate_kbps": 4600},
+        "blackout_active": True,
+    })
+    assert "4600" in window.m_bitrate.text()
+    assert window.overlay.emergency
+    window.monitor_button.click()
+    assert worker.stopping
+    assert not window.monitor_button.isEnabled()
+    worker.finished.emit()
+    assert window.monitor_button.text() == "Start monitoring"
+    assert window.m_bitrate.text() == "Unavailable"
+    assert window.stream_status.text() == "Stream: Not observed"
+    window.overlay.close()
+    window.close()
+
+
+def test_optimizer_preserves_preflight_upload_when_live_samples_arrive():
+    from datetime import datetime, timezone
+
+    _app()
+    window = MainWindow()
+    window._network_measurements = {
+        "upload_mbps": 5.0, "upload_measured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    window._obs_config = {"profile": "Disposable", "mode": "Simple", "bitrate": 6000}
+    window._on_sample({"sample": {"stream_active": False, "bitrate_kbps": None}})
+    assert window.opt_table.item(0, 1).text() == "6000.0"
+    assert window.opt_table.item(0, 2).text() == "3500"
+    assert window.opt_apply.isEnabled()
+    window._on_sample({"sample": {"stream_active": True, "bitrate_kbps": 4900}})
+    assert window.opt_table.item(0, 1).text() == "6000.0"
+    assert not window.opt_apply.isEnabled()
+    window.overlay.close()
+    window.close()
