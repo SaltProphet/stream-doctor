@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from PySide6.QtCore import QThread, Qt, Signal, QTimer
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QFont
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
+    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QPushButton, QSlider, QSpinBox, QStackedWidget,
     QScrollArea, QSizeGrip, QStyle, QHeaderView, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -23,6 +23,7 @@ from .measurements import build_optimizer_inputs, fresh_upload
 from .network import measure_cloudflare_upload, measure_network_quality, measure_upload_capacity
 from .obs import ObsClient, ObsConnectionError
 from .optimizer import change_profile_bitrate, inspect_stream_profile
+from .recovery import switch_program_scene
 from .reports import export_report, report_format_for_path
 from .session import ConnectionSettings, MonitoringSession
 from .telemetry import hardware_snapshot
@@ -91,8 +92,6 @@ class MonitorWorker(QThread):
 # UI components
 # ---------------------------------------------------------------------------
 class TaskWorker(QThread):
-    completed = Signal(object, str)
-
     def __init__(self, task, parent):
         super().__init__(parent)
         self.task = task
@@ -101,9 +100,9 @@ class TaskWorker(QThread):
         try:
             result = self.task()
         except Exception as exc:
-            self.completed.emit(None, str(exc))
+            self.result = (None, str(exc))
         else:
-            self.completed.emit(result, "")
+            self.result = (result, "")
 
 
 class MiniChart(QWidget):
@@ -473,6 +472,10 @@ class MainWindow(QMainWindow):
         self.dashboard_warning.setWordWrap(True)
         self.dashboard_warning.setObjectName("dashboardWarning")
         layout.addWidget(self.dashboard_warning)
+        self.recover_video_button = QPushButton("Choose recovery scene…")
+        self.recover_video_button.clicked.connect(self._open_scene_recovery)
+        self.recover_video_button.hide()
+        layout.addWidget(self.recover_video_button, 0, Qt.AlignLeft)
 
         self.bitrate_chart = MiniChart()
         self.dropped_chart = MiniChart()
@@ -674,8 +677,73 @@ class MainWindow(QMainWindow):
         self.diag_text = QLabel("Start monitoring to collect evidence.")
         self.diag_text.setWordWrap(True)
         layout.addWidget(self.diag_text)
+        recovery = QPushButton("Choose recovery scene…")
+        recovery.setToolTip("Preview and switch to another OBS program scene without restarting the broadcast.")
+        recovery.clicked.connect(self._choose_recovery_scene)
+        layout.addWidget(recovery)
+        self.recovery_status = QLabel("")
+        self.recovery_status.setWordWrap(True)
+        layout.addWidget(self.recovery_status)
         layout.addStretch()
         return page
+
+    def _open_scene_recovery(self) -> None:
+        self._show_screen("Diagnostics")
+        self._choose_recovery_scene()
+
+    def _choose_recovery_scene(self) -> None:
+        settings = self.worker.settings if self.worker else self._current_settings()
+
+        async def scenes():
+            client = ObsClient(settings.url, settings.password)
+            try:
+                await client.connect()
+                return await client.request("GetSceneList")
+            finally:
+                await client.close()
+
+        if self._run_task(lambda: asyncio.run(scenes()), lambda result, error: self._recovery_scenes_loaded(settings, result, error)):
+            self.recovery_status.setText("Reading OBS scenes…")
+
+    def _recovery_scenes_loaded(self, settings, result, error) -> None:
+        if error:
+            self.recovery_status.setText(f"Could not read OBS scenes: {error}")
+            return
+        current = result.get("currentProgramSceneName")
+        choices = [scene["sceneName"] for scene in result.get("scenes", []) if scene["sceneName"] != current]
+        if not current or not choices:
+            self.recovery_status.setText("OBS needs another scene to switch to.")
+            return
+        target, accepted = QInputDialog.getItem(
+            self, "Switch live program scene", "Preview and switch to this OBS scene", choices, 0, False,
+        )
+        if not accepted:
+            self.recovery_status.setText("Scene switch canceled.")
+            return
+        self._run_recovery_switch(settings, current, target)
+
+    def _run_recovery_switch(self, settings, current, target) -> None:
+        async def recover():
+            client = ObsClient(settings.url, settings.password)
+            try:
+                await client.connect()
+                return await switch_program_scene(client, current, target)
+            finally:
+                await client.close()
+
+        def completed(result, error):
+            if error:
+                self.recovery_status.setText(f"Scene recovery could not be verified: {error}")
+                return
+            summary = "Recovery scene selected; OBS still reports black video" if result["program_black"] else "Recovery scene selected; OBS video verified"
+            self.recovery_status.setText(summary)
+            self.store.record("recovery", summary, result)
+            self._refresh_incidents()
+
+        if self._run_task(lambda: asyncio.run(recover()), completed):
+            self.recovery_status.setText("Checking the target scene and verifying the switch…")
+        else:
+            self.recovery_status.setText("Another OBS operation is in progress. Try again.")
 
     def _optimizer_page(self) -> QWidget:
         page = QWidget()
@@ -900,15 +968,18 @@ class MainWindow(QMainWindow):
             return False
         worker = TaskWorker(task, self)
         self._task = worker
-        worker.completed.connect(callback)
+        worker.callback = callback
         worker.finished.connect(self._task_finished)
         worker.start()
         return True
 
     def _task_finished(self) -> None:
-        self._task.deleteLater()
+        worker = self._task
         self._task = None
+        worker.deleteLater()
         self.connect_button.setEnabled(True)
+        if not self._quitting:
+            worker.callback(*worker.result)
         self._finish_quit_if_ready()
 
     def _test_connection(self) -> None:
@@ -969,6 +1040,7 @@ class MainWindow(QMainWindow):
         self.stream_status.setText("Stream: Not observed")
         for metric in (self.m_bitrate, self.m_dropped, self.m_render, self.m_network):
             metric.setText("Unavailable")
+        self.recover_video_button.hide()
         self.dashboard_warning.setText("Start monitoring to see live stream health.")
         self.overlay.update_sample({})
         self.overlay.status_row.setText("Monitoring stopped")
@@ -999,7 +1071,9 @@ class MainWindow(QMainWindow):
             self.stream_status.setText("Stream: Not observed")
         else:
             self.obs_status.setText("OBS: Connected")
-        if record.get("blackout_active") or (record.get("video_event") or {}).get("summary") == "Black video detected":
+        blackout = bool(record.get("blackout_active") or (record.get("video_event") or {}).get("summary") == "Black video detected")
+        self.recover_video_button.setVisible(blackout and record.get("_obs_connected") is not False)
+        if blackout:
             self.health_status.setText("Health: Black video")
             self.dashboard_warning.setText("OBS program video is black. Check the active scene and capture source.")
         else:

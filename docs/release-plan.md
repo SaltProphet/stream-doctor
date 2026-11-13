@@ -16,3 +16,14 @@
 6. Before wider distribution, check Windows keyboard navigation, tray recovery and display scaling at 100%, 125%, 150%, and 200%. Record unsupported optimizer operations and unavailable measurements in the release notes.
 
 The hosted disposable RTMP test has yet to activate its local output. The Shadow PC evidence establishes live monitoring and recovery. The live overlay alert and measured optimizer workflow have their own acceptance checks above.
+
+## Phased diagnosis and recovery roadmap
+
+| Phase | Operator workflow | Acceptance evidence |
+| --- | --- | --- |
+| 1. Live recovery | Choose a recovery scene in Diagnostics. Preview it, switch OBS program output, and verify the resulting local video. | A known black scene switches to a non-black scene while the broadcast stays active. The incident report records the action and verification. Black targets and changed program scenes are refused. |
+| 2. Diagnose the failing stage | Compare OBS reconnects and output congestion with interval rendering and encoding counters, program video, and capture-source evidence. | Controlled source, upload, encoding, and rendering failures each produce a distinct diagnosis or an explicit unknown result. |
+| 3. Correct the cause | Offer a tested bitrate change with rollback for constrained upload. For capture faults, verify a known-good fallback or a supported source recovery action. Surface the available correction next to its evidence. | Reproduce the original symptom, apply one correction, verify that the relevant metric recovers, and check the broadcast afterward. |
+| 4. Optional automatic recovery | Enable a user-selected fallback for sustained local video loss. Add a cooldown, prevent repeated switching, and retain manual control. | Repeated faults, an unavailable fallback, intentional black scenes, and operator scene changes are all exercised on disposable OBS before use on a live broadcast. |
+
+The Phase 1 scene action can restore visible program output while a source issue is investigated. The live connection path and any downstream playback failure require their own evidence. Optimize and verify OBS settings against a disposable profile before using them on a working broadcast.

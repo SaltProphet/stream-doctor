@@ -24,6 +24,7 @@ from stream_doctor.obs import ObsClient
 from stream_doctor.reports import export_report
 from stream_doctor.core import IncidentStore
 from stream_doctor.monitoring import BlackoutTracker, LiveMonitor, VideoObservation
+from stream_doctor.recovery import switch_program_scene
 from stream_doctor.optimizer import change_profile_bitrate, inspect_stream_profile
 from stream_doctor.telemetry import hardware_snapshot
 from stream_doctor.video import FrameAnalyzer, analyze_png_data
@@ -168,6 +169,12 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
                 blackout_events.append(event)
         if not any(event.get("recovery_status") == "recovered" for event in blackout_events):
             raise RuntimeError("OBS screenshot blackout did not recover.")
+        await request_retry(client, "CreateScene", {"sceneName": "StreamDoctorRecoveryBlack"})
+        await request_retry(client, "SetCurrentProgramScene", {"sceneName": "StreamDoctorRecoveryBlack"})
+        recovery_result = await switch_program_scene(client, "StreamDoctorRecoveryBlack", "StreamDoctorTestScene")
+        if recovery_result["program_black"]:
+            raise RuntimeError("Recovery scene still reports black video.")
+        print("OBS recovery scene switch and non-black program video verified", flush=True)
         incident_store = IncidentStore(root / "incidents.sqlite3")
         monitor = LiveMonitor(lambda: client, incident_store, interval=0.2)
         if active_output:

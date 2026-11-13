@@ -5,7 +5,6 @@ import asyncio
 from datetime import datetime, timezone
 import time
 from typing import Any
-from dataclasses import dataclass
 from .video import FrameAnalyzer, analyze_png_data
 
 
@@ -20,6 +19,7 @@ class MonitorSample:
     render_lag_ms: float | None
     encoding_lag_ms: float | None
     network_loss_percent: float | None
+    output_congestion: float | None = None
 
 
 @dataclass(frozen=True)
@@ -100,17 +100,19 @@ def diagnose_sample(sample: MonitorSample) -> Diagnosis:
         return Diagnosis("rendering", f"Rendering lag is {sample.render_lag_ms:.1f} ms, indicating render pressure.", "Reduce scene/rendering load.")
     if sample.network_loss_percent is not None and sample.network_loss_percent >= 1:
         return Diagnosis("network", f"Dropped frames coincide with measured network loss of {sample.network_loss_percent:.1f}%.", "Investigate the active adapter or reduce bitrate.")
+    if sample.output_congestion is not None and sample.output_congestion >= 0.5:
+        return Diagnosis("network", f"OBS reports {sample.output_congestion:.0%} output congestion.", "Check upload stability and run Preflight when idle to evaluate a lower bitrate.")
     if sample.dropped_frames and sample.total_frames and sample.dropped_frames / sample.total_frames >= 0.01:
-        return Diagnosis("network", f"OBS reports {sample.dropped_frames} dropped frames out of {sample.total_frames}; cause is not isolated.", "Collect more samples before changing settings.")
+        return Diagnosis("output", f"OBS reports {sample.dropped_frames} dropped frames out of {sample.total_frames}; cause is not isolated.", "Collect more samples before changing settings.")
     return Diagnosis("healthy", "No threshold breach is present in this sample.", "Continue monitoring.")
 
 
 def sample_from_obs(stats: dict[str, Any], stream: dict[str, Any], network_loss_percent: float | None, timestamp: str) -> MonitorSample:
     render_total = stats.get("renderTotalFrames") or 0
     render_skipped = stats.get("renderSkippedFrames") or 0
-    output_total = stats.get("outputTotalFrames") or stream.get("outputTotalFrames")
-    output_skipped = stats.get("outputSkippedFrames") or stream.get("outputSkippedFrames")
-    return MonitorSample(timestamp, bool(stream.get("outputActive")), bool(stream.get("outputReconnecting")), None, output_skipped, output_total, _lag(stats, render_total, render_skipped), None, network_loss_percent)
+    output_total = stream.get("outputTotalFrames", stats.get("outputTotalFrames"))
+    output_skipped = stream.get("outputSkippedFrames", stats.get("outputSkippedFrames"))
+    return MonitorSample(timestamp, bool(stream.get("outputActive")), bool(stream.get("outputReconnecting")), None, output_skipped, output_total, _lag(stats, render_total, render_skipped), None, network_loss_percent, stream.get("outputCongestion"))
 
 
 def derive_bitrate_kbps(previous_bytes: int | float | None, current_bytes: int | float | None, elapsed_seconds: float) -> float | None:
