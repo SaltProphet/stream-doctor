@@ -361,7 +361,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_tray()
         self._apply_theme()
-        self.monitor_button.setFocus()
+        self.connect_button.setFocus()
 
         smoke_file = os.environ.get("STREAM_DOCTOR_SMOKE_FILE")
         if smoke_file:
@@ -435,6 +435,16 @@ class MainWindow(QMainWindow):
         heading = QLabel("Dashboard")
         heading.setObjectName("pageTitle")
         layout.addWidget(heading)
+        self.connection_panel = QFrame()
+        self.connection_panel.setObjectName("metricCard")
+        connection_layout = QVBoxLayout(self.connection_panel)
+        self.connection_help = QLabel("Open OBS, then connect Stream Doctor.")
+        self.connection_help.setWordWrap(True)
+        connection_layout.addWidget(self.connection_help)
+        setup = QPushButton("OBS connection settings")
+        setup.clicked.connect(lambda: self._show_screen("Settings"))
+        connection_layout.addWidget(setup, 0, Qt.AlignLeft)
+        layout.addWidget(self.connection_panel)
         strip = QFrame()
         strip.setObjectName("statusStrip")
         strip_l = QHBoxLayout(strip)
@@ -455,8 +465,8 @@ class MainWindow(QMainWindow):
         self.monitor_button.setObjectName("primary")
         self.monitor_button.setAccessibleDescription("Starts or stops Stream Doctor telemetry only.")
         self.monitor_button.clicked.connect(self._toggle_monitoring)
-        controls.addWidget(self.monitor_button)
         controls.addWidget(self.connect_button)
+        controls.addWidget(self.monitor_button)
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -1084,11 +1094,17 @@ class MainWindow(QMainWindow):
     def _on_state(self, text: str) -> None:
         self.connection_status.setText(text)
         if text.startswith("Connected"):
+            self.connection_panel.hide()
             self.obs_status.setText("OBS: Connected")
             self.connect_button.setText("Reconnect to OBS")
         elif "error" in text.lower() or "Unavailable" in text:
             self.obs_status.setText("OBS: Unavailable")
-            self.obs_status.setObjectName("statusCritical")
+            self.connection_help.setText(
+                "Open OBS and enable Tools → WebSocket Server Settings. "
+                "If authentication is enabled, enter the WebSocket password in OBS connection settings."
+            )
+            self.connection_panel.show()
+            self.connect_button.setText("Connect to OBS")
 
     def _on_sample(self, record: dict) -> None:
         self.last_record = record
@@ -1104,6 +1120,7 @@ class MainWindow(QMainWindow):
             self._on_state("Unavailable: OBS disconnected. Reconnecting…")
             self.stream_status.setText("Stream: Not observed")
         else:
+            self.connection_panel.hide()
             self.obs_status.setText("OBS: Connected")
         blackout = bool(record.get("blackout_active") or (record.get("video_event") or {}).get("summary") == "Black video detected")
         self.recover_video_button.setVisible(blackout and record.get("_obs_connected") is not False)
@@ -1302,8 +1319,13 @@ class MainWindow(QMainWindow):
         self.tray.showMessage("Stream Doctor", "Still running in the system tray. Live Monitor remains available.")
 
     def _write_smoke_probe(self, path: str) -> None:
-        # Minimal compatibility stub so existing smoke probes do not crash
-        result = {"window_title": self.windowTitle(), "sidebar": True}
+        result = {
+            "window_title": self.windowTitle(),
+            "sidebar": self.nav.count() == len(self.pages),
+            "dashboard": self.nav.currentItem().text(),
+            "connection_setup_visible": self.connection_panel.isVisible(),
+        }
+        self.grab().save(str(Path(path).with_suffix(".png")))
         Path(path).write_text(json.dumps(result), encoding="utf-8")
 
 
