@@ -68,6 +68,7 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
     identified = None
     authentication_enforced = False
     local_output_server = None
+    ffmpeg_log = None
     try:
         for _ in range(20):
             try:
@@ -104,6 +105,7 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
         test_value = 1234 if original_bitrate != 1234 else 1200
         applied = await change_profile_bitrate(client, profile_name, original_bitrate, test_value)
         restored = await change_profile_bitrate(client, profile_name, test_value, original_bitrate)
+        print(f"OBS Simple Output bitrate verified: {original_bitrate} → {applied['bitrate']} → {restored['bitrate']}", flush=True)
         settings_cycle = {"status": "PASS", "controlled_test": True, "verified_apply": True,
                           "applied_bitrate": applied["bitrate"], "restored_bitrate": restored["bitrate"],
                           "original_bitrate": original_bitrate}
@@ -112,21 +114,27 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
         await request_retry(client, "SetCurrentProgramScene", {"sceneName": "StreamDoctorTestScene"})
         active_output_samples = []
         if active_output:
+            ffmpeg_log = (root / "ffmpeg.log").open("w+b")
             local_output_server = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                 "-listen", "1", "-i", "rtmp://127.0.0.1:19350/live/stream-doctor-local",
-                "-f", "null", "-", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                "-c", "copy", "-f", "null", "-", stdout=subprocess.DEVNULL, stderr=ffmpeg_log,
             )
             await asyncio.sleep(1)
             await request_retry(client, "SetStreamServiceSettings", {"streamServiceType": "rtmp_custom", "streamServiceSettings": {"server": "rtmp://127.0.0.1:19350/live", "key": "stream-doctor-local"}})
             await request_retry(client, "StartStream")
-            for _ in range(20):
+            for _ in range(80):
                 status = await client.request("GetStreamStatus")
                 active_output_samples.append(bool(status.get("outputActive")))
                 if status.get("outputActive"):
                     break
                 await asyncio.sleep(0.25)
             if not any(active_output_samples):
+                ffmpeg_log.seek(0)
+                print(ffmpeg_log.read().decode(errors="replace"), flush=True)
+                logs = sorted((config / "logs").glob("*.txt"), key=lambda path: path.stat().st_mtime)
+                if logs:
+                    print(logs[-1].read_text(encoding="utf-8", errors="replace")[-9000:], flush=True)
                 raise RuntimeError("Disposable RTMP output did not become active.")
         snapshot = await client.snapshot()
         analyzer = FrameAnalyzer(freeze_samples=3)
@@ -148,6 +156,8 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             event = blackout_tracker.observe(video, datetime.now(timezone.utc).isoformat(), {"stream_active": True, "scene": "StreamDoctorTestScene", "bitrate_kbps": 0, "dropped_frames": 0, "intentional_scene": True})
             if event:
                 blackout_events.append(event)
+        if not any(event.get("recovery_status") == "recovered" for event in blackout_events):
+            raise RuntimeError("OBS screenshot blackout did not recover.")
         incident_store = IncidentStore(root / "incidents.sqlite3")
         monitor = LiveMonitor(lambda: client, incident_store, interval=0.2)
         if active_output:
@@ -156,7 +166,9 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             await request_retry(client, "SetInputSettings", {"inputName": "StreamDoctorColor", "inputSettings": {"color": 0}, "overlay": False})
             await asyncio.sleep(3.0)
             await request_retry(client, "SetInputSettings", {"inputName": "StreamDoctorColor", "inputSettings": {"color": 4278190335}, "overlay": False})
-            await monitor_task
+            await asyncio.wait_for(monitor_task, timeout=40)
+            if not any(row["category"] == "blackout" and row["recovery_status"] == "recovered" for row in incident_store.search()):
+                raise RuntimeError("Active OBS blackout recovery was not persisted.")
         else:
             await monitor.run(max_samples=3)
         await client.connect()
@@ -176,6 +188,8 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
             if local_output_server.returncode is None:
                 local_output_server.terminate()
             await local_output_server.wait()
+        if ffmpeg_log is not None:
+            ffmpeg_log.close()
         await client.close()
         process.terminate()
         try:
