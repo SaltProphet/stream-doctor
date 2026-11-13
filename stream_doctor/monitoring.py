@@ -15,13 +15,20 @@ SUSTAINED_CONGESTION_SAMPLES = 3
 def summarize_broadcast(samples: list[dict[str, Any]]) -> dict[str, Any]:
     """Summarize one observed broadcast without treating idle samples as evidence."""
     active = [sample for sample in samples if sample.get("stream_active")]
-    congestion = [float(sample.get("output_congestion")) for sample in active if isinstance(sample.get("output_congestion"), (int, float))]
+    congestion = []
     skipped = [int(sample.get("dropped_frames")) for sample in active if isinstance(sample.get("dropped_frames"), int)]
-    congested = sum(value >= CONGESTION_THRESHOLD for value in congestion)
     longest_run = 0
     current_run = 0
-    for value in congestion:
+    congested = 0
+    for sample in active:
+        value = sample.get("output_congestion")
+        if not isinstance(value, (int, float)):
+            current_run = 0
+            continue
+        value = float(value)
+        congestion.append(value)
         if value >= CONGESTION_THRESHOLD:
+            congested += 1
             current_run += 1
             longest_run = max(longest_run, current_run)
         else:

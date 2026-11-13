@@ -82,6 +82,18 @@ def test_summarize_broadcast_requires_consecutive_congestion_samples():
     assert result["sustained_congestion"] is False
 
 
+def test_missing_congestion_sample_breaks_sustained_run():
+    result = summarize_broadcast([
+        {"stream_active": True, "output_congestion": 0.8},
+        {"stream_active": True},
+        {"stream_active": True, "output_congestion": 0.9},
+        {"stream_active": True, "output_congestion": 0.9},
+    ])
+
+    assert result["longest_congestion_run"] == 2
+    assert result["sustained_congestion"] is False
+
+
 def test_live_monitor_persists_samples_and_reconnects_after_disconnect(tmp_path):
     from stream_doctor.core import IncidentStore
     from stream_doctor.monitoring import LiveMonitor
