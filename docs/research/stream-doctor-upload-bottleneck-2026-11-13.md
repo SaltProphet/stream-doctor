@@ -77,6 +77,27 @@ imports, covered by `tests/test_tools_import.py`.
 
 ## Next research step
 
-The publishing baseline is now established. A bandwidth-cap experiment may be
-added as a separate controlled phase, followed by the bitrate comparison; no
-such cap or correction is included in this baseline run.
+The publishing baseline is now established, and the controlled cap comparison
+below has been completed with rollback verification.
+
+## Controlled cap trials
+
+The trial harness used the same fixed OBS profile, x264 encoder, moving color
+source, 15-second window, and localhost RTMP path for all three trials. The
+relay cap was 4 Mbps (500,000 bytes/sec), above the corrected stream's expected
+3.16 Mbps total (3,000 video + 160 audio) and below the current stream's
+approximately 6.3 Mbps total.
+
+| Trial | OBS bitrate | Max congestion delta | New skipped output frames | Reconnect samples | FFmpeg frames | FFmpeg media time |
+|---|---:|---:|---:|---:|---:|---:|
+| Uncapped current | 6,000 kbps | 0.00 | 0 | 0 | 443 | 14.72 s |
+| Capped current | 6,000 kbps | 1.00 | 80 | 0 | 336 | 13.823 s |
+| Capped lower | 3,000 kbps | 0.00 | 0 | 0 | 443 | 14.72 s |
+
+The capped-current trial reproduced a measurable delivery failure before the
+bitrate change. The lower bitrate was applied only while OBS was idle, read
+back as 3,000 kbps, and then restored while idle; final read-back was 6,000
+kbps. Delivery improved under the same cap: congestion returned to zero, newly
+skipped frames returned to zero, and FFmpeg media progress matched the uncapped
+trial. Full sanitized evidence is in
+`%TEMP%\stream-doctor-obs-test\trials\trials-report.json`.
