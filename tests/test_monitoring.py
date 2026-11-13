@@ -105,3 +105,13 @@ def test_live_monitor_records_only_observed_stream_transitions(tmp_path):
     summaries = [item["summary"] for item in store.search()]
     assert "Broadcast started" in summaries
     assert "Broadcast ended" in summaries
+
+
+def test_sustained_output_congestion_and_skipped_frames_have_distinct_diagnoses():
+    from dataclasses import replace
+
+    sample = MonitorSample("now", True, False, 6000, 80, 400, 4, None, None,
+                           output_congestion=1.0, new_skipped_frames=0, congestion_samples=1)
+    assert diagnose_sample(sample).category == "healthy"
+    assert diagnose_sample(replace(sample, new_skipped_frames=8)).category == "output"
+    assert diagnose_sample(replace(sample, congestion_samples=3)).category == "network"

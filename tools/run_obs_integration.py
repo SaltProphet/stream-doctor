@@ -57,6 +57,7 @@ async def run(obs_path: Path, keep: bool, active_output: bool = False) -> int:
     (staged_obs / "portable_mode.txt").write_text("", encoding="utf-8")
     config = staged_obs / "config" / "obs-studio"
     config.mkdir(parents=True)
+    (config / "user.ini").write_text("[General]\nFirstRun=true\n", encoding="utf-8")
     test_password = "stream-doctor-local-test-password"
     (config / "global.ini").write_text(f"[OBSWebSocket]\nServerEnabled=true\nServerPort=4456\nAuthRequired=true\nServerPassword={test_password}\n", encoding="utf-8")
     profile = config / "basic" / "profiles" / "StreamDoctorTest"

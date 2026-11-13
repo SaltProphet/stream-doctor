@@ -486,6 +486,10 @@ class MainWindow(QMainWindow):
         self.recover_video_button.clicked.connect(self._open_scene_recovery)
         self.recover_video_button.hide()
         layout.addWidget(self.recover_video_button, 0, Qt.AlignLeft)
+        self.connection_fix_button = QPushButton("Review bitrate correction")
+        self.connection_fix_button.clicked.connect(lambda: self._show_screen("Optimizer"))
+        self.connection_fix_button.hide()
+        layout.addWidget(self.connection_fix_button, 0, Qt.AlignLeft)
 
         self.bitrate_chart = MiniChart()
         self.dropped_chart = MiniChart()
@@ -1051,6 +1055,7 @@ class MainWindow(QMainWindow):
         for metric in (self.m_bitrate, self.m_dropped, self.m_render, self.m_network):
             metric.setText("Unavailable")
         self.recover_video_button.hide()
+        self.connection_fix_button.hide()
         self.dashboard_warning.setText("Start monitoring to see live stream health.")
         self.overlay.update_sample({})
         self.overlay.status_row.setText("Monitoring stopped")
@@ -1090,12 +1095,20 @@ class MainWindow(QMainWindow):
             self.obs_status.setText("OBS: Connected")
         blackout = bool(record.get("blackout_active") or (record.get("video_event") or {}).get("summary") == "Black video detected")
         self.recover_video_button.setVisible(blackout and record.get("_obs_connected") is not False)
+        congestion = sample.get("output_congestion")
+        sustained = active and cat == "network" and sample.get("congestion_samples", 0) >= 3
+        self.connection_fix_button.setVisible(sustained)
         if blackout:
             self.health_status.setText("Health: Black video")
             self.dashboard_warning.setText("OBS program video is black. Check the active scene and capture source.")
         else:
             self.dashboard_warning.setText(diagnosis.get("next_action") or "Waiting for live telemetry.")
             self.health_status.setText(f"Health: {cat.capitalize()}" if active else "Monitoring: Active")
+            if sustained:
+                self.dashboard_warning.setText(
+                    f"OBS reports {congestion:.0%} output congestion. "
+                    "Review the bitrate correction. Settings can be applied after the stream stops."
+                )
 
         bitrate = sample.get("bitrate_kbps")
         self.m_bitrate.setText(f"{bitrate:.1f} kbps" if isinstance(bitrate, (int, float)) else "Unavailable")
@@ -1120,7 +1133,9 @@ class MainWindow(QMainWindow):
         self.diag_text.setText(
             f"Category: {cat}\nExplanation: {diagnosis.get('explanation', '—')}\n"
             f"Next action: {diagnosis.get('next_action', '—')}\n"
-            f"Evidence: bitrate={bitrate}, dropped={dropped}/{total}, render_lag={render}"
+            f"Observed bitrate: {self.m_bitrate.text()} • Render time: {self.m_render.text()}\n"
+            f"Output congestion: {f'{congestion:.0%}' if congestion is not None else 'Unavailable'} • "
+            f"New skipped frames: {sample.get('new_skipped_frames') if sample.get('new_skipped_frames') is not None else 'Unavailable'}"
         )
 
         live_config = record.get("obs_config") or {}
