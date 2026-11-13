@@ -30,7 +30,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed." }
           }
           .\build_windows.ps1 -InnoCompiler $compiler
-      - name: Verify silent installation, packaged startup and uninstall
+      - name: Verify silent installation, packaged startup, reinstall and uninstall
         shell: pwsh
         run: |
           $setup = (Get-ChildItem .\installer-output\StreamDoctor-Setup-*.exe | Select-Object -First 1).FullName
@@ -48,10 +48,13 @@ jobs:
             }
             if (-not (Test-Path $probe)) { throw "Installed application did not initialize." }
             $state = Get-Content $probe | ConvertFrom-Json
-            if (-not $state.sidebar -or $state.window_title -ne "Stream Doctor") { throw "Unexpected packaged startup result." }
+            if (-not $state.sidebar -or $state.window_title -ne "Stream Doctor" -or $state.dashboard -ne "Dashboard" -or -not $state.connection_setup_visible) { throw "Unexpected packaged startup result." }
           } finally {
             if (-not $app.HasExited) { Stop-Process -Id $app.Id }
           }
+          $reinstall = Start-Process $setup -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') -Wait -PassThru
+          if ($reinstall.ExitCode -ne 0 -or -not (Test-Path (Join-Path $target StreamDoctor.exe))) { throw "Reinstall failed." }
+          Copy-Item (Join-Path $env:RUNNER_TEMP stream-doctor-smoke.png) .\installer-output\StreamDoctor-first-launch.png
           $uninstall = Start-Process (Join-Path $target unins000.exe) -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
           if ($uninstall.ExitCode -ne 0 -or (Test-Path (Join-Path $target StreamDoctor.exe))) { throw "Uninstall failed." }
       - uses: actions/upload-artifact@v4
@@ -60,6 +63,13 @@ jobs:
           path: |
             dist/StreamDoctor/
             installer-output/StreamDoctor-Setup-*.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StreamDoctor-Installer
+          path: |
+            installer-output/StreamDoctor-Setup-*.exe
+            installer-output/StreamDoctor-first-launch.png
           if-no-files-found: error
 
   disposable-obs:
