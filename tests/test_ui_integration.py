@@ -186,6 +186,38 @@ def test_optimizer_preserves_preflight_upload_when_live_samples_arrive():
     window.close()
 
 
+def test_dashboard_shows_sustained_congestion_evidence_and_measured_basis():
+    from datetime import datetime, timezone
+
+    _app()
+    window = MainWindow()
+    window._network_measurements = {"upload_mbps": 5.0, "upload_measured_at": datetime.now(timezone.utc).isoformat(), "upload_source": "test"}
+    window._obs_config = {"profile": "Disposable", "mode": "Simple", "bitrate": 6000}
+    for skipped, congestion in ((0, 0.8), (20, 0.9), (40, 1.0)):
+        window._on_sample({"sample": {"stream_active": True, "bitrate_kbps": 6000, "dropped_frames": skipped, "total_frames": 1000, "output_congestion": congestion, "reconnecting": False}, "diagnosis": {"category": "network"}, "video": None})
+
+    assert "sustained congestion" in window.congestion_evidence.text().lower()
+    assert "3 samples" in window.congestion_evidence.text()
+    assert "measured upload" in window.dashboard_correction.text().lower()
+    assert window.dashboard_apply.isEnabled() is False
+    window.overlay.close()
+    window.close()
+
+
+def test_dashboard_reports_next_broadcast_correction_result():
+    _app()
+    window = MainWindow()
+    window._last_broadcast_metrics = {"sustained_congestion": True, "max_congestion": 1.0, "skipped_frames": 80}
+    window._pending_correction = {"target": 3000, "baseline": window._last_broadcast_metrics}
+    window._on_sample({"sample": {"stream_active": True, "output_congestion": 0.0, "dropped_frames": 0, "reconnecting": False}, "diagnosis": {}, "video": None})
+    window._on_sample({"sample": {"stream_active": False}, "diagnosis": {}, "video": None})
+    assert "improved" in window.next_broadcast_result.text().lower()
+    assert "congestion" in window.next_broadcast_result.text().lower()
+    assert "skipped" in window.next_broadcast_result.text().lower()
+    window.overlay.close()
+    window.close()
+
+
 def test_clear_history_removes_old_rows_from_next_export(monkeypatch, tmp_path):
     import json
     from PySide6.QtWidgets import QMessageBox

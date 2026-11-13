@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .core import IncidentStore, RecommendationEngine
-from .monitoring import LiveMonitor
+from .monitoring import LiveMonitor, compare_broadcasts, summarize_broadcast
 from .measurements import build_optimizer_inputs, fresh_upload
 from .network import measure_cloudflare_upload, measure_network_quality, measure_upload_capacity
 from .obs import ObsClient, ObsConnectionError
@@ -349,6 +349,10 @@ class MainWindow(QMainWindow):
         self._task = None
         self._quitting = False
         self._last_optimizer_view = None
+        self._last_stream_active = False
+        self._broadcast_samples: list[dict] = []
+        self._last_broadcast_metrics: dict | None = None
+        self._pending_correction: dict | None = None
 
         self.overlay = FloatingMonitor()
         self.overlay.open_dashboard.connect(self._show_from_overlay)
@@ -472,6 +476,27 @@ class MainWindow(QMainWindow):
         self.dashboard_warning.setWordWrap(True)
         self.dashboard_warning.setObjectName("dashboardWarning")
         layout.addWidget(self.dashboard_warning)
+        self.congestion_evidence = QLabel("Sustained congestion evidence: waiting for an active broadcast.")
+        self.congestion_evidence.setWordWrap(True)
+        self.congestion_evidence.setObjectName("dashboardEvidence")
+        layout.addWidget(self.congestion_evidence)
+        self.dashboard_correction = QLabel("Measured upload bitrate correction: run Preflight while OBS is idle.")
+        self.dashboard_correction.setWordWrap(True)
+        layout.addWidget(self.dashboard_correction)
+        self.next_broadcast_result = QLabel("Next-broadcast result: apply a correction, then monitor the next broadcast.")
+        self.next_broadcast_result.setWordWrap(True)
+        layout.addWidget(self.next_broadcast_result)
+        correction_actions = QHBoxLayout()
+        self.dashboard_apply = QPushButton("Apply measured bitrate correction")
+        self.dashboard_apply.setEnabled(False)
+        self.dashboard_apply.clicked.connect(self._apply_optimizer_recommendation)
+        self.dashboard_rollback = QPushButton("Rollback bitrate correction")
+        self.dashboard_rollback.setEnabled(False)
+        self.dashboard_rollback.clicked.connect(self._rollback_optimizer_change)
+        correction_actions.addWidget(self.dashboard_apply)
+        correction_actions.addWidget(self.dashboard_rollback)
+        correction_actions.addStretch()
+        layout.addLayout(correction_actions)
         self.recover_video_button = QPushButton("Choose recovery scene…")
         self.recover_video_button.clicked.connect(self._open_scene_recovery)
         self.recover_video_button.hide()
@@ -906,6 +931,10 @@ class MainWindow(QMainWindow):
                 return
             self._obs_config = config
             self._optimizer_backup = None if rollback else (settings, profile, current, target)
+            if rollback:
+                self._pending_correction = None
+            else:
+                self._pending_correction = {"target": target, "baseline": self._last_broadcast_metrics}
             self._refresh_optimizer()
             self.opt_status.setText(f"OBS verified {'restoration to' if rollback else 'the new setting of'} {target} kbps.")
 
@@ -1034,6 +1063,8 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.clear_history_button.setEnabled(True)
         self.last_record = {}
+        self._last_stream_active = False
+        self._broadcast_samples = []
         self.monitor_button.setText("Start monitoring")
         self.monitor_button.setEnabled(True)
         self.health_status.setText("Monitoring: Stopped")
@@ -1042,9 +1073,11 @@ class MainWindow(QMainWindow):
             metric.setText("Unavailable")
         self.recover_video_button.hide()
         self.dashboard_warning.setText("Start monitoring to see live stream health.")
+        self.congestion_evidence.setText("Sustained congestion evidence: waiting for an active broadcast.")
         self.overlay.update_sample({})
         self.overlay.status_row.setText("Monitoring stopped")
         self.overlay.set_emergency(False)
+        self._update_optimizer_buttons()
         self._refresh_incidents()
         self._finish_quit_if_ready()
 
@@ -1064,6 +1097,7 @@ class MainWindow(QMainWindow):
         sample = record.get("sample", {})
         diagnosis = record.get("diagnosis", {})
         active = bool(sample.get("stream_active"))
+        self._update_broadcast_evidence(sample, active)
         self.stream_status.setText("Stream: Streaming" if active else "Stream: Not streaming")
         cat = diagnosis.get("category", "unknown")
         if record.get("_obs_connected") is False:
@@ -1115,6 +1149,38 @@ class MainWindow(QMainWindow):
         if record.get("video_event") and self.nav.currentRow() == 4:
             self._refresh_incidents()
 
+    def _update_broadcast_evidence(self, sample: dict, active: bool) -> None:
+        if active and not self._last_stream_active:
+            self._broadcast_samples = []
+            if self._pending_correction:
+                self.next_broadcast_result.setText(
+                    f"Next-broadcast result: collecting evidence after the {self._pending_correction['target']} kbps correction…"
+                )
+        if active:
+            self._broadcast_samples.append(sample)
+            metrics = summarize_broadcast(self._broadcast_samples)
+            if metrics["samples"]:
+                state = "sustained congestion detected" if metrics["sustained_congestion"] else "no sustained congestion yet"
+                self.congestion_evidence.setText(
+                    f"Sustained congestion evidence: {state}; {metrics['congestion_samples']} samples ≥ 50%, "
+                    f"peak {metrics['max_congestion']:.0%}, skipped +{metrics['skipped_frames']}, reconnects {metrics['reconnects']}."
+                )
+        elif self._last_stream_active:
+            metrics = summarize_broadcast(self._broadcast_samples)
+            self._last_broadcast_metrics = metrics
+            if self._pending_correction and self._pending_correction.get("baseline"):
+                comparison = compare_broadcasts(self._pending_correction["baseline"], metrics)
+                outcome = "improved" if comparison["improved"] else "did not improve both measures"
+                self.next_broadcast_result.setText(
+                    f"Next-broadcast result: {outcome}; congestion {'improved' if comparison['congestion_improved'] else 'not improved'}, "
+                    f"skipped frames {'improved' if comparison['skipped_frames_improved'] else 'not improved'} "
+                    f"({metrics['skipped_frames']} in this broadcast)."
+                )
+                self._pending_correction = None
+            elif self._pending_correction:
+                self.next_broadcast_result.setText("Next-broadcast result: no earlier broadcast baseline was available for comparison.")
+        self._last_stream_active = active
+
     def _refresh_optimizer(self, sample=None) -> None:
         sample = sample if sample is not None else self.last_record.get("sample", {})
         measurements = build_optimizer_inputs(
@@ -1137,6 +1203,15 @@ class MainWindow(QMainWindow):
             f"Profile: {profile}  •  Bitrate: {bitrate}  •  Internet upload: {upload_text}\n"
             f"{obs['resolution'] or 'Unavailable resolution'}  •  {fps}  •  Encoder: {obs['encoder'] or 'Unavailable'}"
         )
+        if upload and obs["bitrate_kbps"]:
+            self.dashboard_correction.setText(
+                f"Measured upload bitrate correction: {upload:.2f} Mbps basis with a 30% stability margin; "
+                "the suggested change is opt-in and applies only while OBS is idle."
+            )
+        else:
+            self.dashboard_correction.setText(
+                "Measured upload bitrate correction: unavailable until Preflight measures upload while OBS is idle."
+            )
         recs = self.engine.recommend(**measurements)
         self._optimizer_recommendations = recs
         self._update_optimizer_buttons()
@@ -1172,6 +1247,9 @@ class MainWindow(QMainWindow):
                  self._optimizer_recommendations[row]["setting"] == "bitrate_kbps")
         self.opt_apply.setEnabled(apply)
         self.opt_rollback.setEnabled(not active and self._optimizer_backup is not None)
+        if hasattr(self, "dashboard_apply"):
+            self.dashboard_apply.setEnabled(apply)
+            self.dashboard_rollback.setEnabled(not active and self._optimizer_backup is not None)
 
     def _toggle_overlay(self, on: bool) -> None:
         self.overlay.setVisible(on)

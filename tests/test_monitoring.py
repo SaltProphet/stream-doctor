@@ -1,4 +1,10 @@
-from stream_doctor.monitoring import MonitorSample, diagnose_sample, derive_bitrate_kbps
+from stream_doctor.monitoring import (
+    MonitorSample,
+    compare_broadcasts,
+    derive_bitrate_kbps,
+    diagnose_sample,
+    summarize_broadcast,
+)
 import asyncio
 
 
@@ -31,6 +37,34 @@ def test_diagnosis_attributes_lag_to_encoder():
 
 def test_bitrate_is_derived_from_output_byte_delta_not_cumulative_bytes():
     assert derive_bitrate_kbps(1_000_000, 1_250_000, 1.0) == 2000.0
+
+
+def test_summarize_broadcast_marks_sustained_congestion_and_skipped_delta():
+    samples = [
+        {"stream_active": True, "output_congestion": 0.1, "dropped_frames": 4, "reconnecting": False},
+        {"stream_active": True, "output_congestion": 0.7, "dropped_frames": 12, "reconnecting": False},
+        {"stream_active": True, "output_congestion": 0.8, "dropped_frames": 24, "reconnecting": True},
+        {"stream_active": True, "output_congestion": 0.9, "dropped_frames": 39, "reconnecting": False},
+    ]
+
+    result = summarize_broadcast(samples)
+
+    assert result["sustained_congestion"] is True
+    assert result["congestion_samples"] == 3
+    assert result["max_congestion"] == 0.9
+    assert result["skipped_frames"] == 35
+    assert result["reconnects"] == 1
+
+
+def test_compare_broadcasts_reports_congestion_and_skipped_frame_improvement():
+    before = {"sustained_congestion": True, "max_congestion": 1.0, "skipped_frames": 80}
+    after = {"sustained_congestion": False, "max_congestion": 0.0, "skipped_frames": 0}
+
+    assert compare_broadcasts(before, after) == {
+        "congestion_improved": True,
+        "skipped_frames_improved": True,
+        "improved": True,
+    }
 
 
 def test_live_monitor_persists_samples_and_reconnects_after_disconnect(tmp_path):
